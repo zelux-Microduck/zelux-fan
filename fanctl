@@ -1,0 +1,1474 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""fanctl —— RK3566（Radxa Zero 3W）可配置 PWM 风扇实例控制。
+
+一个文件、零第三方依赖（只用 Python 标准库），插上就能按温度自动调速。
+
+它做三件事：
+1. **自动温控**（默认）：每 2 秒读一次 CPU 温度，套阶梯曲线算出转速百分比，
+   写进 PWM。这是"风扇自己会转"的部分 —— 不用你在旁边守着。
+2. **手动调速**：命令行 / unix socket 都能下 `{"op":"set","index":0,"pct":80}`。
+   手动值会持有一段时间（默认 120 秒）再回到自动 —— 防止手滑点了 100% 忘了改回来。
+3. **转速自检**：全速 1 秒，读 tach 看是不是真在转。这是唯一能证明"风扇没坏"的办法。
+
+为什么要有 systemd 服务 + unix socket 这一层：
+`/sys/class/pwm` 只有 root 能写。web 界面 / 业务程序一般以普通用户跑，直接写会 EACCES。
+fanctl 以 root 常驻，对外只暴露一行 JSON 的 socket，攻击面就是 `{"op":"set",...}` 这句话。
+不需要远程控制的话，socket 可以关掉（配置 `socket_enable = false`），只在命令行用。
+
+硬件前提（Radxa Zero 3W 实测，别按"常见接法"改）：
+* 风扇 1：PWM14 / GPIO3_C4（全局 116），**没有测速线**，只能调速；
+* 风扇 2：PWM12 / GPIO149 调速 + GPIO150 测速（4pin 带 tach）；
+* 两颗都是 period=40000ns / 25 kHz / normal polarity，duty 0–40000。
+* 前提：设备树里 PWM 通道得先 probe 出来（Armbian 一般开 `rk3566-pwm` 那类 overlay，
+  或用你的板子厂家提供的方式）。fanctl 只负责"往已经出现的通道写值"，不替你改设备树。
+
+命令行用法：
+    sudo fanctl --serve                 # 常驻：自动温控 + 可选 socket（systemd 用这个）
+    sudo fanctl --status                # 打印各路风扇当前状态（转速、百分比、通道路径）
+    sudo fanctl --selftest              # 全速 1 秒 → 读转速 → 回原值（验风扇转不转）
+    sudo fanctl --auto                  # 前台跑自动温控（调试用，Ctrl-C 退出）
+    sudo fanctl --set 0 80              # 第 0 路设 80%
+    sudo fanctl --once '{"op":"set","index":1,"pct":60}'
+    sudo fanctl --stdin                 # 从标准输入逐行读 JSON，逐行回显（SSH 手测）
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import math
+import os
+import signal
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+try:                                  # grp 只有 Unix 有；没有它只是设不了 socket 的组
+    import grp
+except ImportError:                   # pragma: no cover
+    grp = None  # type: ignore[assignment]
+
+# ---------------------------------------------------------------- 常量
+DEFAULT_CONFIG = Path("/etc/fanctl.toml")
+DEFAULT_INVENTORY_FILE = '/var/lib/fanctl/inventory.json'
+PWM_ROOT = Path("/sys/class/pwm")
+GPIO_ROOT = Path("/sys/class/gpio")
+THERMAL_ROOT = Path("/sys/class/thermal")
+
+DEFAULT_PERIOD_NS = 40000           # 25 kHz
+MIN_PERIOD_NS = 1000
+MAX_PERIOD_NS = 10_000_000
+DEFAULT_PCT = 60
+DEFAULT_TEMP_HOLD_S = 120           # 手动档持有多久后交回自动
+AUTO_INTERVAL_S = 2.0               # 温控轮询周期
+TACH_WINDOW_S = 0.4                 # 转速测量窗口（短一点，web 端等不起 1 秒）
+PULSES_PER_REV = 2                  # 4pin 风扇常见值；读数整体差 2 倍就改这个
+TACH_MIN_RPM = 300                  # 自检判据：低于它就是没转 / 线没插
+MAX_TEMP_SANE = 150.0               # 超过这个数当作读错了，忽略
+
+log = logging.getLogger("fanctl")
+SOCKET_API_VERSION = 1
+_TACH_EXPORTED_BY_US: set[int] = set()
+
+
+class FanBusyError(RuntimeError):
+    """The requested operation conflicts with or cannot release a hardware resource."""
+
+
+# ================================================================ 温控纯函数
+def clamp_pct(pct: Any, lo: int = 0, hi: int = 100) -> int:
+    """面板/命令行输入什么都能进来（null/-1/1200），这里统一夹紧，别让 duty 溢出。"""
+    try:
+        v = int(round(float(pct)))
+    except (TypeError, ValueError):
+        return DEFAULT_PCT
+    return lo if v < lo else hi if v > hi else v
+
+
+def pct_to_duty(pct: Any, period_ns: int) -> int:
+    return int(round(clamp_pct(pct) / 100.0 * max(1, period_ns)))
+
+
+def rpm_from_hz(hz: float, pulses_per_rev: int = PULSES_PER_REV) -> int:
+    """4pin 风扇一般每转 2 个脉冲。ppr 配错时读数会整体偏 2 倍，先看这个参数。"""
+    ppr = max(1, int(pulses_per_rev))
+    return max(0, int(round(max(0.0, float(hz)) * 60.0 / ppr)))
+
+
+def normalize_curve(curve: Any, default: list[list[int]]) -> list[list[int]]:
+    """校验温控阶梯：[[温度, 百分比], ...]，按温度升序、夹紧、同温度去重。
+
+    错的曲线比没有曲线更糟（比如温度写反了会导致越热越慢），所以宁可回退默认值。
+    """
+    rows: list[list[int]] = []
+    if isinstance(curve, (list, tuple)):
+        for item in curve:
+            try:
+                t, p = float(item[0]), int(item[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not (-10 <= t <= 120):
+                continue
+            rows.append([int(round(t)), clamp_pct(p)])
+    if not rows:
+        return [list(r) for r in default]
+    rows.sort(key=lambda r: r[0])
+    out: list[list[int]] = []
+    for t, p in rows:                       # 同一温度只留最后一条，避免二义
+        if out and out[-1][0] == t:
+            out[-1] = [t, p]
+        else:
+            out.append([t, p])
+    return out
+
+
+def curve_pct(temp: float | None, curve: list[list[int]], default: int = DEFAULT_PCT) -> int:
+    """阶梯温控：温度 >= 台阶温度就套那一档，都不满足用默认值。
+
+    默认 60% 而不是 0%：停转会让主控在重负载下十几秒就上 80℃，
+    而且风扇重启时的"咯"一下比常转更烦人。
+    """
+    pct = clamp_pct(default)
+    if temp is None:
+        return pct
+    for t, p in curve:
+        if float(temp) >= t:
+            pct = p
+    return pct
+
+
+def read_max_temp() -> float | None:
+    """读所有 thermal_zone，返回最高温度（℃）。读不到返回 None，不猜。"""
+    best: float | None = None
+    if not THERMAL_ROOT.exists():
+        return None
+    for zone in THERMAL_ROOT.glob("thermal_zone*"):
+        try:
+            raw = int((zone / "temp").read_text("ascii").strip())
+        except (OSError, ValueError):
+            continue
+        val = raw / 1000.0
+        if 0 < val < MAX_TEMP_SANE and (best is None or val > best):
+            best = val
+    return round(best, 1) if best is not None else None
+
+
+# ================================================================ 配置
+FALLBACK_CHANNELS: list[dict] = []  # Never guess the number of fans or board pins.
+FALLBACK_CURVE = [[58, 70], [64, 85], [70, 100]]
+
+
+def clamp_int(value: Any, lo: int, hi: int, default: int) -> int:
+    try:
+        return max(lo, min(hi, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def as_bool(value: Any, default: bool) -> bool:
+    """TOML 里布尔是 true/false；但手写或环境变量进来的可能是字符串。
+
+    `bool("false")` 是 True —— 这种坑一旦踩上就是"关不掉"，所以显式解析。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "on", "y"):
+        return True
+    if s in ("0", "false", "no", "off", "n", ""):
+        return False
+    return default
+
+
+# ---------------------------------------------------------------- 极简 TOML
+def _mini_toml(text: str) -> dict:
+    """Python < 3.11 没有 tomllib 时的兜底解析。
+
+    只实现配置文件实际用到的子集：`[表]`、`[[数组表]]`、`key = 值`，
+    值支持字符串 / 整数 / 浮点 / true|false / 一维和二维数组。
+    遇到不认识的复杂结构**明确报错**（而不是猜），免得把配置静默读错。
+    """
+    import ast as _ast
+
+    def conv(v: str):
+        v = v.strip()
+        # TOML 的布尔是 true/false，不是 Python 的 True/False，先归一
+        low = v.lower()
+        if low == "true":
+            return True
+        if low == "false":
+            return False
+        if v.startswith("[") or v.startswith("{"):
+            return _ast.literal_eval(v)      # 数组 / 内联表交给 python 字面量
+        return _ast.literal_eval(v)          # 数字 / 字符串
+
+    root: dict = {}
+    cur = root
+    cur_path: list[str] = []
+
+    def _table(path: list[str], arr: bool) -> dict:
+        node = root
+        for key in path[:-1]:
+            if key not in node or not isinstance(node[key], dict):
+                node[key] = {}
+            node = node[key]
+        last = path[-1]
+        if arr:
+            node.setdefault(last, [])
+            if not isinstance(node[last], list):
+                raise ValueError(f"[[{'.'.join(path)}]] 与前面的定义冲突")
+            item: dict = {}
+            node[last].append(item)
+            return item
+        node.setdefault(last, {})
+        if not isinstance(node[last], dict):
+            raise ValueError(f"[{'.'.join(path)}] 与前面的定义冲突")
+        return node[last]
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # 去掉行尾注释（简单处理：不在引号内的 # ）
+        if "#" in line:
+            out, in_str = [], None
+            for ch in line:
+                if in_str:
+                    out.append(ch)
+                    if ch == in_str:
+                        in_str = None
+                elif ch in "\"'":
+                    in_str = ch
+                    out.append(ch)
+                elif ch == "#":
+                    break
+                else:
+                    out.append(ch)
+            line = "".join(out).strip()
+            if not line:
+                continue
+        if line.startswith("[["):
+            if not line.endswith("]]"):
+                raise ValueError(f"第 {lineno} 行：[[...]] 没闭合")
+            path = [p.strip() for p in line[2:-2].split(".")]
+            cur = _table(path, arr=True)
+            cur_path = path
+            continue
+        if line.startswith("["):
+            if not line.endswith("]"):
+                raise ValueError(f"第 {lineno} 行：[...] 没闭合")
+            path = [p.strip() for p in line[1:-1].split(".")]
+            cur = _table(path, arr=False)
+            cur_path = path
+            continue
+        if "=" not in line:
+            raise ValueError(f"第 {lineno} 行：不是 key = value")
+        key, _, val = line.partition("=")
+        key = key.strip()
+        if not key:
+            raise ValueError(f"第 {lineno} 行：缺少键名")
+        try:
+            cur[key] = conv(val)
+        except Exception as exc:
+            raise ValueError(f"第 {lineno} 行：值解析失败（{val.strip()}）：{exc}") from None
+    return root
+
+
+def load_config(path: Path) -> dict:
+    """读 TOML；文件不存在 / 解析不了都退回内置默认值（保证裸跑也能用）。"""
+    if not path.exists():
+        log.info("%s 不存在，用内置默认值（两颗风扇 / 25 kHz / 60%% 起步）", path)
+        return {}
+    text = path.read_text("utf-8")
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            log.debug("Python 无 tomllib（<3.11），改用内置极简解析器")
+            return _mini_toml(text)
+        except Exception as exc:
+            log.error("%s 语法错，用内置默认值：%s", path, exc)
+            return {}
+    try:
+        return tomllib.loads(text)
+    except Exception as exc:
+        log.error("%s 语法错，用内置默认值：%s", path, exc)
+        return {}
+
+
+# ================================================================ PWM 通道
+class PwmChannel:
+    """一个 PWM 输出。
+
+    通道解析顺序（宁可报错也不猜，控制错脚比控制不了更糟）：
+    1. 配置里写死的 chip/channel（真机确认过的唯一可靠来源）；
+    2. 内核已经把通道导出成 `pwm<全局号>`（老内核的全局编号风格）；
+    3. 放弃，返回人话原因。
+    """
+
+    def __init__(self, spec: dict, period_ns: int) -> None:
+        self.pwm = clamp_int(spec.get("pwm"), 0, 999, -1)
+        self.id = str(spec.get("id") or (f"fan-pwm{self.pwm}" if self.pwm >= 0 else "fan-unmapped"))
+        self.name = str(spec.get("name") or self.id)
+        self.gpio = clamp_int(spec.get("gpio"), -1, 9999, -1)
+        self.tach = clamp_int(spec.get("tach"), 0, 65535, 0)
+        self.chip = clamp_int(spec.get("chip"), -1, 255, -1)
+        self.channel = clamp_int(spec.get("channel"), -1, 255, -1)
+        self.period_ns = period_ns
+        self.pulses_per_rev = clamp_int(spec.get("pulses_per_rev"), 1, 16, PULSES_PER_REV)
+        self._path: Path | None = None
+        self._exported_by_us = False
+        self._tach_exported_by_us = False
+        self._duty = 0
+        self._why = ""
+
+    # -- 解析 --------------------------------------------------------
+    def path(self) -> Path | None:
+        if self._path is not None and self._path.exists():
+            return self._path
+        self._path = None
+        if self.chip >= 0 and self.channel >= 0:
+            # Use pre-exported PWM channels only; fanctl never exports PWM
+            chip_path = PWM_ROOT / f"pwmchip{self.chip}"
+            node = chip_path / f"pwm{self.channel}"
+            if node.exists():
+                self._exported_by_us = False
+                self._path = node
+                return self._path
+            self._why = (f"{self.name}: PWM channel pwmchip{self.chip}/pwm{self.channel} not pre-exported. "
+                         f"fanctl only uses already-exported PWM channels. "
+                         f"Check device tree or kernel PWM overlay configuration.")
+            return None  # Explicit mapping must never fall back to another chip.
+            return None  # Fail fast: chip/channel configured but not pre-exported
+        if self.pwm >= 0:
+            for chip in self._chips():
+                direct = chip / f"pwm{self.pwm}"
+                if direct.exists():
+                    self._path = direct
+                    return self._path
+        self._why = (f"{self.name}: 找不到 PWM 通道（配置 chip={self.chip}/channel={self.channel}，"
+                     f"全局号 pwm{self.pwm}）。先在真机 `ls /sys/class/pwm/` 看有哪些 chip，"
+                     f"再改配置文件里的 chip/channel")
+        return None
+
+    @staticmethod
+    def _chips() -> list[Path]:
+        if not PWM_ROOT.exists():
+            return []
+        chips = []
+        for p in PWM_ROOT.glob("pwmchip*"):
+            try:
+                chips.append((int(p.name[7:]), p))
+            except ValueError:
+                continue
+        return [p for _, p in sorted(chips)]
+
+    # -- 读写 --------------------------------------------------------
+    def _write(self, name: str, value: int) -> None:
+        node = self.path()
+        if node is None:
+            raise RuntimeError(self._why or f"{self.name}: PWM 通道不可用")
+        try:
+            (node / name).write_text(str(int(value)), "ascii")
+        except OSError as exc:
+            raise RuntimeError(f"{self.name}: 写 {name}={value} 失败：{exc}") from None
+
+    def apply(self, duty: int, period: int | None = None) -> int:
+        period = clamp_int(period or self.period_ns, MIN_PERIOD_NS, MAX_PERIOD_NS, self.period_ns)
+        duty = max(0, min(period, int(duty)))
+        # 顺序有讲究：enable=1 时改 period 有些内核直接 EBUSY，
+        # 而 duty > period 写 period 会被 EINVAL 顶回来，所以先把 enable 关掉。
+        try:
+            self._write("enable", 0)
+        except RuntimeError:
+            pass
+        # 必须读**内核里真实的** period 来比：刚 export 的通道 period 是 0，
+        # 此时只写 duty 会被内核拒掉（EINVAL），风扇一动不动还看不出为什么。
+        if self._read_int("period", 0) != period:
+            self._write("duty_cycle", 0)
+            self._write("period", period)
+        self.period_ns = period
+        self._write("duty_cycle", duty)
+        self._write("enable", 1)
+        self._duty = duty
+        return duty
+
+    def release(self) -> dict:
+        """Stop driving this instance (duty=0, enable=0) but never unexport PWM.
+
+        fanctl never unexports PWM channels because it never exports them.
+        Only tach GPIOs that were exported by this service (via measure_hz)
+        are unexported on release.
+        """
+        node = self.path()
+        resource = f"pwmchip{self.chip}/pwm{self.channel}"
+        if node is None:
+            return {"ok": False, "resource": resource,
+                    "error": self._why or "PWM resource is unavailable"}
+        released = []
+        # Stop PWM: duty=0, enable=0
+        try:
+            (node / "duty_cycle").write_text("0", "ascii")
+            (node / "enable").write_text("0", "ascii")
+        except OSError as exc:
+            return {"ok": False, "resource": resource, "error": f"cannot stop PWM: {exc}"}
+        # Never unexport PWM - fanctl only uses pre-exported channels
+        if self.tach:
+            # Query module set for actual ownership - only GPIO we exported via measure_hz is owned by us
+            tach_release = release_tach_gpio(self.tach, owned=None)
+            if not tach_release.get("ok"):
+                return {"ok": False, "resource": tach_release["resource"],
+                        "error": tach_release["error"], "resources": released}
+            released.append(tach_release)
+        self._path = None
+        self._exported_by_us = False
+        self._duty = 0
+        released.append({"ok": True, "resource": resource, "stopped": True,
+                         "unexported": False})
+        return {"ok": True, "resources": released}
+
+    def _read_int(self, name: str, default: int = 0) -> int:
+        node = self.path()
+        if node is None:
+            return default
+        try:
+            return int((node / name).read_text("ascii").strip())
+        except (OSError, ValueError):
+            return default
+
+    def read_duty(self) -> int:
+        return self._read_int("duty_cycle", self._duty)
+
+    def pct(self) -> int:
+        period = max(1, self.period_ns)
+        return int(round(max(0, min(period, self.read_duty())) * 100.0 / period))
+
+    def rpm(self) -> int | None:
+        """只有带测速线的风扇才有值；没有就返回 None（不猜，不写 0）。"""
+        if not self.tach:
+            return None
+        hz = measure_hz(self.tach, TACH_WINDOW_S)
+        if hz is None:
+            return None
+        return rpm_from_hz(hz, self.pulses_per_rev)
+
+    def info(self, control_mode: str | None = None) -> dict:
+        node = self.path()
+        return {"id": self.id, "name": self.name, "pwm": self.pwm, "gpio": self.gpio,
+                "chip": self.chip, "channel": self.channel, "tach": self.tach or None,
+                "pulses_per_rev": self.pulses_per_rev,
+                "period_ns": self.period_ns, "duty": self.read_duty(), "pct": self.pct(),
+                "rpm": self.rpm(), "path": str(node) if node else None,
+                "hardware_available": node is not None,
+                "health": "ready" if node is not None else "unavailable",
+                "why": "" if node else self._why,
+                "control_mode": control_mode or "auto"}
+
+
+# ================================================================ 测速
+def release_tach_gpio(gpio: int, *, owned: bool | None = None) -> dict:
+    resource = f"gpio{gpio}"
+    if owned is None:
+        owned = gpio in _TACH_EXPORTED_BY_US
+    if not owned:
+        return {"ok": True, "resource": resource, "stopped": True, "unexported": False}
+    try:
+        (GPIO_ROOT / "unexport").write_text(str(gpio), "ascii")
+    except OSError as exc:
+        return {"ok": False, "resource": resource, "error": f"cannot unexport tach GPIO: {exc}"}
+    _TACH_EXPORTED_BY_US.discard(gpio)
+    return {"ok": True, "resource": resource, "stopped": True, "unexported": True}
+
+
+def measure_hz(gpio: int, window: float = TACH_WINDOW_S) -> float | None:
+    """在 sysfs 上数上升沿。
+
+    故意不用 libgpiod：gpiod 的 request 是独占的，fanctl 一占，
+    别的程序（或你自己的代码）就永远拿不到这条线，rpm 变 null 还查不出原因。
+    sysfs 谁都能读，代价是 window 秒的忙轮询 —— 只在有人问转速时才发生。
+    """
+    node = GPIO_ROOT / f"gpio{gpio}"
+    preexisting = node.exists()  # Track if GPIO was already exported
+    exported_by_us = False  # Track whether we successfully exported it
+    try:
+        if not preexisting:
+            (GPIO_ROOT / "export").write_text(str(gpio), "ascii")
+            exported_by_us = True  # Only set if write succeeds
+            _TACH_EXPORTED_BY_US.add(gpio)  # Track even when subsequent reads fail.
+            for _ in range(10):
+                if node.exists():
+                    break
+                time.sleep(0.01)
+        (node / "direction").write_text("in", "ascii")
+        try:
+            (node / "edge").write_text("rising", "ascii")
+        except OSError:
+            pass                       # 有的内核不让改 edge，照样能轮询
+    except OSError as exc:
+        log.debug("GPIO%d 不可用：%s", gpio, exc)
+        return None
+
+    value = node / "value"
+
+    def _read() -> str | None:
+        """读一次电平；读不到（或读到空 / 垃圾）返回 None。
+
+        真机 sysfs 读属性是原子的，永远给 "0" 或 "1"；但容错起见，
+        空串 / 非 0-1 的读取当作"这次没读到"，**不更新 prev、不计数** ——
+        否则一次瞬时空读会被当成电平跳变，把转速数错。
+        """
+        try:
+            s = value.read_text("ascii").strip()
+        except OSError:
+            return None
+        return s if s in ("0", "1") else None
+
+    prev = _read()
+    if prev is None:
+        return None
+    edges = 0
+    end = time.monotonic() + window
+    while time.monotonic() < end:
+        cur = _read()
+        if cur is None:
+            continue                       # 瞬时空读：跳过，不要当成跳变
+        if cur == "1" and prev == "0":
+            edges += 1
+        prev = cur
+    # Track ownership: only mark as exported by us if we actually exported it successfully
+    if exported_by_us and node.exists():
+        _TACH_EXPORTED_BY_US.add(gpio)
+    return edges / window
+
+
+# ================================================================ 控制器
+class Controller:
+    """风扇总控：持有各路 PWM、温控曲线、模式和自动循环。"""
+
+    def __init__(self, cfg: dict) -> None:
+        fan = cfg.get("fan") or {}
+        self.period_ns = clamp_int(fan.get("period_ns"), MIN_PERIOD_NS, MAX_PERIOD_NS,
+                                   DEFAULT_PERIOD_NS)
+        self.default_pct = clamp_int(fan.get("default_pct"), 0, 100, DEFAULT_PCT)
+        self.socket_path = str(fan.get("socket") or "/run/fanctl/fan.sock")
+        self.socket_enable = as_bool(fan.get("socket_enable"), True)
+        # socket_group: explicit TOML > env var > standalone default (empty string)
+        if "socket_group" in fan:
+            self.group = str(fan.get("socket_group") or "").strip()
+        else:
+            env_group = os.environ.get("FANCTL_SOCKET_GROUP", "")
+            self.group = env_group.strip()
+        # inventory_file: explicit TOML > env var > standalone default
+        if "inventory_file" in fan:
+            self.inventory_file = Path(str(fan.get("inventory_file") or DEFAULT_INVENTORY_FILE))
+        else:
+            env_inventory = os.environ.get("FANCTL_INVENTORY_FILE", DEFAULT_INVENTORY_FILE)
+            # Use default if env var is present but empty
+            self.inventory_file = Path(env_inventory or DEFAULT_INVENTORY_FILE)
+        self.temp_hold_s = clamp_int(fan.get("temp_hold_s"), 0, 3600, DEFAULT_TEMP_HOLD_S)
+        self.auto_enable = as_bool(fan.get("auto"), True)
+
+        # 曲线：支持三种写法，优先 [fan.curve].points（配置模板用的这种）
+        #   [fan.curve] points = [...]      -> cfg["fan"]["curve"]["points"]
+        #   [curve]     points = [...]      -> cfg["curve"]["points"]
+        #   curve = [[...]]                 -> 顶层数组
+        curve_cfg = None
+        fc = fan.get("curve")
+        if isinstance(fc, dict):
+            curve_cfg = fc.get("points") or fc.get("curve")
+        elif fc is not None:
+            curve_cfg = fc
+        if curve_cfg is None:
+            top = cfg.get("curve")
+            curve_cfg = (top.get("points") if isinstance(top, dict) else top)
+        self.curve = normalize_curve(curve_cfg, FALLBACK_CURVE)
+
+        inventory = None
+        if self.inventory_file.exists():
+            try:
+                inventory = json.loads(self.inventory_file.read_text("utf-8"))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"风扇实例清单不可读取，拒绝回退到默认引脚：{exc}") from None
+            self._validate_inventory(inventory)
+            specs = [self._instance_spec(item) for item in inventory["instances"] if item["enabled"]]
+            self.curve = normalize_curve(inventory["curve"], FALLBACK_CURVE)
+            self.default_pct = clamp_pct(inventory["default_pct"])
+        else:
+            specs = fan.get("channel") or FALLBACK_CHANNELS
+        self.fans = [PwmChannel(dict(s), clamp_int(s.get("period_ns"), MIN_PERIOD_NS,
+                                                   MAX_PERIOD_NS, self.period_ns)) for s in specs]
+        # Validate that all active fans have valid PWM paths (fail closed if not)
+        for channel in self.fans:
+            if channel.path() is None:
+                log.warning("%s", channel._why)
+        self.inventory = inventory or self._legacy_inventory(specs)
+        # Fail closed: validate the derived inventory before accepting it
+        try:
+            self._validate_inventory(self.inventory)
+        except (ValueError, FanBusyError) as exc:
+            raise RuntimeError(f"Invalid fan inventory, cannot start: {exc}") from None
+        # Tach ownership is tracked via _TACH_EXPORTED_BY_US module set after successful export in measure_hz.
+        # Do NOT infer ownership here based on GPIO existence - preexisting GPIO is not owned by us.
+        self.pulses_per_rev = clamp_int(fan.get("pulses_per_rev"), 1, 16, PULSES_PER_REV)
+
+        self.mode = "auto"  # Restart always restores thermal control.
+        self.auto_enable = self.mode == "auto"
+        self.last_pct: int | None = None
+        self.manual_until = 0.0            # Global manual hold (legacy, for compatibility)
+        self._auto_task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+        self._inventory_lock = threading.RLock()  # Synchronous lock for socket dispatch
+        # Per-instance manual overrides: {instance_id: {"pct": int, "until": float, "hold_s": float}}
+        self._manual_overrides: dict[str, dict] = {}
+        log.info("装载 %d 路风扇，period=%d ns，默认 %d%%，模式=%s",
+                 len(self.fans), self.period_ns, self.default_pct, self.mode)
+        # Save initial inventory if it doesn't exist yet - fail closed if persistence fails
+        if not self.inventory_file.exists():
+            try:
+                self._save_inventory(self.inventory)
+                log.info("已保存初始风扇实例清单到 %s", self.inventory_file)
+            except Exception as exc:
+                raise RuntimeError(f"无法保存初始风扇实例清单，服务无法持久化状态：{exc}") from None
+
+    @staticmethod
+    def _instance_spec(instance: dict) -> dict:
+        pwm = instance["pwm"]
+        return {"id": instance["id"], "name": instance["name"], "pwm": -1,
+                "chip": pwm["chip"], "channel": pwm["channel"],
+                "tach": instance.get("tach_gpio") or 0,
+                "period_ns": instance["period_ns"],
+                "pulses_per_rev": instance.get("pulses_per_rev", PULSES_PER_REV)}
+
+    def _legacy_inventory(self, specs: list[dict]) -> dict:
+        instances = []
+        for spec in specs:
+            item = PwmChannel(dict(spec), self.period_ns)
+            instances.append({"id": item.id, "name": item.name,
+                              "driver_id": "zelux.fan.radxa-pwm", "enabled": True,
+                              "pwm": {"chip": item.chip, "channel": item.channel},
+                              "period_ns": item.period_ns,
+                              "tach_gpio": item.tach or None,
+                              "pulses_per_rev": clamp_int(spec.get("pulses_per_rev"), 1, 16, PULSES_PER_REV)})
+        return {"schema": "zelux.fan-inventory/v1",
+                "mode": "auto" if self.auto_enable else "manual",
+                "default_pct": self.default_pct, "curve": [list(row) for row in self.curve],
+                "instances": instances}
+
+    @staticmethod
+    def _validate_inventory(value: Any) -> None:
+        if not isinstance(value, dict) or value.get("schema") != "zelux.fan-inventory/v1":
+            raise ValueError("fan inventory schema must be zelux.fan-inventory/v1")
+        if value.get("mode") not in ("auto", "manual"):
+            raise ValueError("fan mode must be auto or manual")
+        if not isinstance(value.get("default_pct"), int) or not 0 <= value["default_pct"] <= 100:
+            raise ValueError("default_pct must be an integer from 0 to 100")
+        if not isinstance(value.get("curve"), list) or not isinstance(value.get("instances"), list):
+            raise ValueError("fan curve and instances must be arrays")
+        for point in value["curve"]:
+            if (not isinstance(point, list) or len(point) != 2
+                    or not isinstance(point[0], (int, float)) or not -10 <= point[0] <= 120
+                    or not isinstance(point[1], int) or not 0 <= point[1] <= 100):
+                raise ValueError("curve points must be [temperature, percent] within supported bounds")
+        if len(value["instances"]) > 16:
+            raise ValueError("at most 16 fan instances are supported")
+        ids: set[str] = set()
+        pwms: set[tuple[int, int]] = set()
+        tach: set[int] = set()
+        for item in value["instances"]:
+            if not isinstance(item, dict):
+                raise ValueError("each fan instance must be an object")
+            identifier = str(item.get("id") or "")
+            if not identifier or len(identifier) > 64 or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for ch in identifier):
+                raise ValueError("fan instance id is invalid")
+            if identifier in ids:
+                raise ValueError(f"duplicate fan instance id: {identifier}")
+            ids.add(identifier)
+            if not isinstance(item.get("name"), str) or not item["name"].strip() or len(item["name"]) > 64:
+                raise ValueError(f"fan {identifier}: name is required (max 64 chars)")
+            if item.get("driver_id") != "zelux.fan.radxa-pwm":
+                raise ValueError(f"fan {identifier}: unsupported driver_id")
+            if not isinstance(item.get("enabled"), bool):
+                raise ValueError(f"fan {identifier}: enabled must be boolean")
+            pwm = item.get("pwm")
+            if not isinstance(pwm, dict):
+                raise ValueError(f"fan {identifier}: pwm mapping is required")
+            chip, channel = int(pwm.get("chip", -1)), int(pwm.get("channel", -1))
+            if not (0 <= chip <= 255 and 0 <= channel <= 255):
+                raise ValueError(f"fan {identifier}: PWM chip/channel is out of range")
+            key = (chip, channel)
+            if key in pwms:
+                raise FanBusyError(f"PWM resource pwmchip{chip}/pwm{channel} is already assigned")
+            pwms.add(key)
+            period = int(item.get("period_ns", 0))
+            if not MIN_PERIOD_NS <= period <= MAX_PERIOD_NS:
+                raise ValueError(f"fan {identifier}: period_ns is out of range")
+            ppr = int(item.get("pulses_per_rev", PULSES_PER_REV))
+            if not 1 <= ppr <= 16:
+                raise ValueError(f"fan {identifier}: pulses_per_rev must be 1..16")
+            gpio = item.get("tach_gpio")
+            if gpio is not None:
+                gpio = int(gpio)
+                if not 0 <= gpio <= 65535 or gpio in tach:
+                    raise FanBusyError(f"fan {identifier}: tach GPIO is invalid or already assigned")
+                tach.add(gpio)
+
+    def _save_inventory(self, inventory: dict) -> None:
+        self._validate_inventory(inventory)
+        self.inventory_file.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.inventory_file.with_name(self.inventory_file.name + ".tmp")
+        data = json.dumps(inventory, ensure_ascii=False, indent=2) + "\n"
+        with temp.open("w", encoding="utf-8") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp, 0o640)
+        os.replace(temp, self.inventory_file)
+
+    def _persist_instances(self, instances: list[dict]) -> dict:
+        inventory = {"schema": "zelux.fan-inventory/v1", "mode": self.mode,
+                     "default_pct": self.default_pct,
+                     "curve": [list(row) for row in self.curve], "instances": instances}
+        self._save_inventory(inventory)
+        self.inventory = inventory
+        return inventory
+
+    def _inventory_copy(self) -> dict:
+        return json.loads(json.dumps(self.inventory))
+
+    def _make_instance(self, instance: dict) -> PwmChannel | None:
+        if not instance["enabled"]:
+            return None
+        spec = self._instance_spec(instance)
+        channel = PwmChannel(spec, spec["period_ns"])
+        if channel.path() is None:
+            raise FanBusyError(channel._why or f"{instance['id']}: PWM resource is unavailable")
+        # Tach ownership is tracked via _TACH_EXPORTED_BY_US module set after successful export in measure_hz.
+        # Do NOT infer ownership here based on GPIO existence - preexisting GPIO is not owned by us.
+        return channel
+
+    def _create_instance(self, instance: Any) -> dict:
+        with self._inventory_lock:
+            candidate = self._inventory_copy()
+            if not isinstance(instance, dict):
+                raise ValueError("create requires an instance object")
+            candidate["instances"].append(instance)
+            self._validate_inventory(candidate)
+            channel = self._make_instance(instance)
+            try:
+                saved = self._persist_instances(candidate["instances"])
+            except Exception:
+                if channel:
+                    channel.release()
+                raise
+            if channel:
+                self.fans.append(channel)
+                try:
+                    safe_pct = self.last_pct if self.last_pct is not None else self.default_pct
+                    channel.apply(pct_to_duty(safe_pct, channel.period_ns))
+                except Exception as exc:
+                    self.fans.remove(channel)
+                    rollback = [item for item in self.inventory["instances"] if item["id"] != instance["id"]]
+                    self._persist_instances(rollback)
+                    channel.release()
+                    raise RuntimeError(f"新实例已登记但无法启用，已回滚：{exc}") from None
+            return {"ok": True, "instance": instance, "inventory": saved}
+
+    def _delete_instance(self, instance_id: Any, confirm: Any) -> dict:
+        with self._inventory_lock:
+            if confirm is not True:
+                raise ValueError("删除风扇实例会停止该实例并释放 PWM，必须显式 confirm=true")
+            identifier = str(instance_id or "")
+            candidate = self._inventory_copy()
+            target = next((item for item in candidate["instances"] if item["id"] == identifier), None)
+            if target is None:
+                raise ValueError(f"不存在风扇实例 {identifier!r}")
+            active = next((fan for fan in self.fans if fan.id == identifier), None)
+            released: list[dict] = []
+            previous_pct = active.pct() if active else 0
+            if active:
+                result = active.release()
+                if not result.get("ok"):
+                    try:
+                        active.apply(pct_to_duty(previous_pct, active.period_ns))
+                    except Exception:
+                        pass
+                    raise FanBusyError(f"释放实例 {identifier} 失败：{result.get('error', 'unknown error')}")
+                released.extend(result.get("resources", []))
+            candidate["instances"] = [item for item in candidate["instances"] if item["id"] != identifier]
+            try:
+                saved = self._persist_instances(candidate["instances"])
+            except Exception:
+                if active:
+                    try:
+                        active.apply(pct_to_duty(previous_pct, active.period_ns))
+                    except Exception as restore_error:
+                        raise RuntimeError(f"清单保存失败且无法恢复实例输出：{restore_error}") from None
+                raise
+            self.fans = [fan for fan in self.fans if fan.id != identifier]
+            self._manual_overrides.pop(identifier, None)
+            return {"ok": True, "deleted": True, "instance_id": identifier,
+                    "released": released, "inventory": saved}
+
+    def _update_instance(self, instance_id: Any, instance: Any) -> dict:
+        with self._inventory_lock:
+            identifier = str(instance_id or "")
+            if not isinstance(instance, dict) or instance.get("id") != identifier:
+                raise ValueError("update requires an instance with the same stable id")
+            candidate = self._inventory_copy()
+            old = next((item for item in candidate["instances"] if item["id"] == identifier), None)
+            if old is None:
+                raise ValueError(f"不存在风扇实例 {identifier!r}")
+            index = candidate["instances"].index(old)
+            previous_inventory = self._inventory_copy()
+            candidate["instances"][index] = instance
+            self._validate_inventory(candidate)
+            current = next((fan for fan in self.fans if fan.id == identifier), None)
+            new_tach = int(instance.get("tach_gpio") or 0)
+            was_enabled = bool(current)
+            now_enabled = instance["enabled"]
+            same_resource = bool(current and now_enabled
+                                 and current.chip == int(instance["pwm"]["chip"])
+                                 and current.channel == int(instance["pwm"]["channel"]))
+            previous_pct = current.pct() if current else 0
+            released: list[dict] = []
+            # Handle same PWM resource with tach config change
+            if same_resource and current:
+                previous_properties = (current.name, current.tach, current.period_ns, current.pulses_per_rev)
+                old_tach = current.tach
+                old_tach_owned = old_tach in _TACH_EXPORTED_BY_US if old_tach else False
+                # Release old tach if it changed and was owned by us
+                if old_tach != new_tach and old_tach and old_tach_owned:
+                    tach_result = release_tach_gpio(old_tach, owned=True)
+                    released.append(tach_result)
+                    if not tach_result.get("ok"):
+                        raise FanBusyError(f"无法释放旧测速 GPIO：{tach_result.get('error')}")
+                # Update channel properties
+                current.name = instance["name"]
+                current.tach = new_tach
+                current.period_ns = int(instance["period_ns"])
+                current.pulses_per_rev = int(instance.get("pulses_per_rev", PULSES_PER_REV))
+                # Tach ownership is tracked via _TACH_EXPORTED_BY_US module set after successful export in measure_hz.
+                # Do NOT infer ownership here based on GPIO existence - preexisting GPIO is not owned by us.
+                try:
+                    current.apply(pct_to_duty(previous_pct, current.period_ns))
+                    saved = self._persist_instances(candidate["instances"])
+                except Exception:
+                    current.name, current.tach, current.period_ns, current.pulses_per_rev = previous_properties
+                    current.apply(pct_to_duty(previous_pct, current.period_ns))
+                    raise
+                return {"ok": True, "instance": instance, "inventory": saved, "released": released}
+            # Handle enabled->disabled: release active channel and tach
+            if was_enabled and not now_enabled and current:
+                release_result = current.release()
+                released.extend(release_result.get("resources", []))
+                if not release_result.get("ok"):
+                    current.apply(pct_to_duty(previous_pct, current.period_ns))
+                    raise FanBusyError(f"禁用实例 {identifier} 失败：{release_result.get('error')}")
+                self.fans.remove(current)
+                try:
+                    saved = self._persist_instances(candidate["instances"])
+                except Exception:
+                    self.fans.append(current)
+                    try:
+                        current.apply(pct_to_duty(previous_pct, current.period_ns))
+                    except Exception:
+                        pass
+                    raise
+                self._manual_overrides.pop(identifier, None)
+                return {"ok": True, "instance": instance, "inventory": saved, "released": released}
+            # Handle disabled->enabled: create and apply
+            if not was_enabled and now_enabled:
+                replacement = self._make_instance(instance)
+                try:
+                    saved = self._persist_instances(candidate["instances"])
+                except Exception:
+                    if replacement:
+                        replacement.release()
+                    raise
+                if replacement:
+                    try:
+                        safe_pct = self.last_pct if self.last_pct is not None else self.default_pct
+                        replacement.apply(pct_to_duty(safe_pct, replacement.period_ns))
+                        self.fans.append(replacement)
+                    except Exception as exc:
+                        self._save_inventory(previous_inventory)
+                        self.inventory = previous_inventory
+                        replacement.release()
+                        raise RuntimeError(f"启用新实例失败：{exc}") from None
+                return {"ok": True, "instance": instance, "inventory": saved}
+            # Handle different PWM resource (was_enabled and now_enabled but different resource)
+            replacement = self._make_instance(instance) if now_enabled else None
+            try:
+                saved = self._persist_instances(candidate["instances"])
+            except Exception:
+                if replacement:
+                    replacement.release()
+                raise
+            if current:
+                rel = current.release()
+                released.extend(rel.get("resources", []))
+                if not rel.get("ok"):
+                    self._save_inventory(previous_inventory)
+                    self.inventory = previous_inventory
+                    if replacement:
+                        replacement.release()
+                    try:
+                        current.apply(pct_to_duty(previous_pct, current.period_ns))
+                    except Exception:
+                        pass
+                    raise FanBusyError(f"旧 PWM 资源释放失败：{rel.get('error')}")
+                self.fans.remove(current)
+            try:
+                if replacement:
+                    safe_pct = self.last_pct if self.last_pct is not None else self.default_pct
+                    replacement.apply(pct_to_duty(safe_pct, replacement.period_ns))
+                    self.fans.append(replacement)
+            except Exception as exc:
+                self._save_inventory(previous_inventory)
+                self.inventory = previous_inventory
+                if replacement:
+                    replacement.release()
+                if current:
+                    try:
+                        current.apply(pct_to_duty(previous_pct, current.period_ns))
+                        self.fans.append(current)
+                    except Exception as restore_error:
+                        raise RuntimeError(f"更新失败且旧实例恢复失败：{restore_error}") from None
+                raise RuntimeError(f"配置已回滚，新实例未能启动：{exc}") from None
+            return {"ok": True, "instance": instance, "inventory": saved, "released": released}
+
+    # -- 辅助 --------------------------------------------------------
+    def fan_index(self, index: Any) -> int:
+        if isinstance(index, str):
+            for i, item in enumerate(self.fans):
+                if item.id == index:
+                    return i
+            raise ValueError(f"不存在风扇实例 {index!r}")
+        try:
+            idx = int(index)
+        except (TypeError, ValueError):
+            raise ValueError(f"index 必须是整数，收到 {index!r}") from None
+        if not 0 <= idx < len(self.fans):
+            raise ValueError(f"没有第 {idx} 路风扇（这台机器只配了 {len(self.fans)} 路）")
+        return idx
+
+    def fan(self, index: Any) -> PwmChannel:
+        idx = self.fan_index(index)
+        return self.fans[idx]
+
+    def _apply_index(self, idx: int, pct: int) -> dict:
+        fan = self.fans[idx]
+        duty = pct_to_duty(pct, fan.period_ns)
+        duty = fan.apply(duty)
+        return {"index": idx, "name": fan.name, "pct": fan.pct(), "duty": duty,
+                "period": fan.period_ns}
+
+    def _apply_all(self, pct: int) -> list[dict]:
+        results = []
+        for i in range(len(self.fans)):
+            try:
+                results.append(self._apply_index(i, pct))
+            except (RuntimeError, ValueError) as exc:
+                results.append({"index": i, "name": self.fans[i].name, "ok": False,
+                                "error": str(exc)})
+        return results
+
+    # -- 模式 --------------------------------------------------------
+    def to_auto(self) -> dict:
+        """Switch to auto mode, clearing all per-instance manual overrides."""
+        self.mode = "auto"
+        self._manual_overrides.clear()  # Clear all per-instance overrides
+        self.manual_until = 0.0         # Clear legacy global hold
+        temp = read_max_temp()
+        pct = curve_pct(temp, self.curve, self.default_pct)
+        applied = self._apply_all(pct)
+        self.last_pct = pct
+        return {"ok": True, "mode": "auto", "pct": pct, "temp": temp,
+                "curve": [list(r) for r in self.curve], "applied": applied}
+
+    def to_manual(self, index: int, pct: int, hold: float | None = None) -> dict:
+        """Set per-instance manual override without changing global mode.
+
+        The global mode remains "auto"; this creates a per-instance override
+        that expires after hold_s seconds. auto_loop will skip applying curve
+        to instances with active overrides.
+        """
+        pct = clamp_pct(pct)
+        fan = self.fans[index]
+        # hold=0 表示"一直手动"：把到期时间推到无穷。
+        # 注意用 float 保留小数 —— 用 int() 截断的话 hold=0.5 会变成 0，
+        # 于是"临时覆盖半秒"静默变成"永久手动"，温控就再也不接管了。
+        try:
+            eff = self.temp_hold_s if hold is None else max(0.0, float(hold))
+        except (TypeError, ValueError):
+            eff = float(self.temp_hold_s)
+        if not math.isfinite(eff) or eff > 3600:
+            raise ValueError("hold_s must be finite and within 0..3600")
+        result = self._apply_index(index, pct)
+        until = math.inf if eff <= 0 else time.monotonic() + eff
+        # Set per-instance override (does not change global mode)
+        self._manual_overrides[fan.id] = {"pct": pct, "until": until, "hold_s": eff}
+        return {"ok": True, "pct": pct, "index": index, "detail": result,
+                "hold_s": eff, "instance_id": fan.id,
+                "note": "一直保持手动（直到 --auto 或重启服务）" if eff <= 0
+                        else f"{eff:g} 秒后自动交回温控曲线"}
+
+    # -- 自动温控循环 ------------------------------------------------
+    async def auto_loop(self) -> None:
+        """每 AUTO_INTERVAL_S 秒：读温度 → 套曲线 → 变化才写 PWM。
+
+        Per-instance manual overrides are respected: instances with active
+        overrides are skipped, and expired overrides are removed.
+        """
+        while not self._stop.is_set():
+            try:
+                # Expire per-instance overrides
+                now = time.monotonic()
+                expired_ids = [fid for fid, ov in self._manual_overrides.items()
+                               if ov["until"] < now]
+                for fid in expired_ids:
+                    del self._manual_overrides[fid]
+                    log.info("实例 %s 手动覆盖到期，交回自动温控", fid)
+
+                if self.mode == "auto":
+                    temp = read_max_temp()
+                    pct = curve_pct(temp, self.curve, self.default_pct)
+                    # Apply curve only to instances without active overrides
+                    for i, fan in enumerate(self.fans):
+                        override = self._manual_overrides.get(fan.id)
+                        if override and override["until"] >= now:
+                            # Instance has active override, skip auto control
+                            continue
+                        # Apply auto curve to this instance
+                        try:
+                            self._apply_index(i, pct)
+                        except (RuntimeError, ValueError) as exc:
+                            log.warning("实例 %s 自动调速失败：%s", fan.id, exc)
+                    self.last_pct = pct
+                    log.debug("温控 %s℃ -> %d%%", temp, pct)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("温控循环出错：%s", exc)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=AUTO_INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+
+    def start_auto(self) -> None:
+        if self._auto_task is None or self._auto_task.done():
+            self._auto_task = asyncio.create_task(self.auto_loop(), name="fan-auto")
+
+    def stop_auto(self) -> None:
+        self._stop.set()
+        if self._auto_task:
+            self._auto_task.cancel()
+
+    # -- 开机兜底 ----------------------------------------------------
+    def boot_apply(self) -> None:
+        """开机先给个安全风速。之后自动循环按温度接管，这里只是别让主控裸奔。"""
+        safe = self.default_pct if not self.auto_enable else max(
+            self.default_pct, curve_pct(read_max_temp(), self.curve, self.default_pct))
+        for fan in self.fans:
+            try:
+                fan.apply(pct_to_duty(safe, fan.period_ns))
+                log.info("%s -> %d%%（开机兜底）", fan.name, safe)
+            except Exception as exc:
+                log.warning("%s 初始调速失败：%s", fan.name, exc)
+        self.last_pct = safe
+
+    # -- 自检 --------------------------------------------------------
+    def selftest(self, index: Any = None) -> dict:
+        targets = [index] if index is not None else list(range(len(self.fans)))
+        results = []
+        for i in targets:
+            fan = self.fan(i)
+            prev = fan.pct()
+            try:
+                fan.apply(fan.period_ns)       # 全速
+                time.sleep(1.0)                # 让风叶真的转起来，0.2 秒读到的是惯性
+                rpm = fan.rpm()
+            except (RuntimeError, ValueError) as exc:
+                results.append({"index": i, "name": fan.name, "ok": None, "error": str(exc)})
+                continue
+            finally:
+                try:
+                    fan.apply(pct_to_duty(prev, fan.period_ns))   # 回到原档
+                except Exception:
+                    pass
+            if rpm is None:
+                results.append({"instance_id": fan.id, "index": i, "name": fan.name, "ok": None, "rpm": None,
+                                "reason": "这颗没有测速线，只能靠听声音/手感判断（4pin 才有 tach）"})
+            else:
+                results.append({"instance_id": fan.id, "index": i, "name": fan.name, "ok": rpm > TACH_MIN_RPM, "rpm": rpm,
+                                "reason": f"全速 rpm={rpm}"
+                                          + ("，风扇在转" if rpm > TACH_MIN_RPM else
+                                             f" ≤ {TACH_MIN_RPM}：风扇没转 / 卡住 / 测速线没插好")})
+        passed = all(r["ok"] is True for r in results) if results else False
+        unknown = any(r["ok"] is None for r in results)
+        return {"ok": None if unknown and not any(r["ok"] is False for r in results) else passed,
+                "items": results, "reason": "缺少测速或硬件读数，无法确认自检通过" if unknown else ""}
+
+    # -- socket 请求分发 ---------------------------------------------
+    def handle(self, req: dict) -> dict:
+        """对外唯一入口，且保证**永远返回 dict、永远不抛**。
+
+        调用方把 error 字段直接给人看，所以这里的每一条错误信息都要是人话。
+        """
+        try:
+            version = req.get("api_version")
+            if version is not None and version != SOCKET_API_VERSION:
+                return {"api_version": SOCKET_API_VERSION, "ok": False,
+                        "code": "unsupported_version",
+                        "error": f"不支持 socket API 版本 {version!r}；当前为 {SOCKET_API_VERSION}"}
+            # Serialize all valid-version requests under the inventory lock.
+            # This ensures concurrent socket requests are processed atomically.
+            with self._inventory_lock:
+                result = self._dispatch(req)
+                result.setdefault("api_version", SOCKET_API_VERSION)
+                if result.get("ok") is False:
+                    result.setdefault("code", "invalid_request")
+            return result
+        except FanBusyError as exc:
+            return {"api_version": SOCKET_API_VERSION, "ok": False, "code": "resource_busy", "error": str(exc)}
+        except (ValueError, TypeError, OverflowError) as exc:
+            return {"api_version": SOCKET_API_VERSION, "ok": False, "code": "invalid_request", "error": str(exc)}
+        except RuntimeError as exc:
+            return {"api_version": SOCKET_API_VERSION, "ok": False, "code": "hardware_error", "error": str(exc)}
+        except Exception as exc:                # 兜底：绝不让异常穿过 socket
+            log.exception("处理请求失败")
+            return {"api_version": SOCKET_API_VERSION, "ok": False, "code": "internal_error",
+                    "error": f"内部错误：{exc}"}
+
+    def _dispatch(self, req: dict) -> dict:
+        op = str(req.get("op") or "").strip().lower()
+        if op in ("ping", ""):
+            return {"ok": True, "pong": True, "fans": len(self.fans), "mode": self.mode}
+        if op == "status":
+            return self.status()
+        if op == "validate":
+            inventory = req.get("inventory")
+            self._validate_inventory(inventory)
+            return {"ok": True, "valid": True, "instances": len(inventory["instances"])}
+        if op == "create":
+            return self._create_instance(req.get("instance"))
+        if op == "update":
+            return self._update_instance(req.get("instance_id"), req.get("instance"))
+        if op == "delete":
+            return self._delete_instance(req.get("instance_id"), req.get("confirm"))
+        if op == "get":
+            fan = self.fan(req.get("instance_id", req.get("index", 0)))
+            override = self._manual_overrides.get(fan.id)
+            control_mode = "manual" if override and override["until"] >= time.monotonic() else "auto"
+            info = fan.info(control_mode)
+            return {"ok": True, "index": self.fan_index(req.get("instance_id", req.get("index", 0))), **info}
+        if op == "temp":
+            return {"ok": True, "temp": read_max_temp()}
+        if op == "curve":
+            if req.get("points") is not None:
+                previous = self.curve
+                self.curve = normalize_curve(req.get("points"), FALLBACK_CURVE)
+                try:
+                    self._persist_instances(self._inventory_copy()["instances"])
+                except Exception:
+                    self.curve = previous
+                    raise
+            return {"ok": True, "curve": [list(r) for r in self.curve]}
+        if op == "auto":
+            result = self.to_auto()
+            if any(item.get("ok") is False for item in result["applied"]):
+                return {**result, "ok": False, "code": "hardware_error", "error": "部分实例恢复自动失败，请检查各实例硬件状态"}
+            return result
+        if op == "set":
+            target = req.get("instance_id", req.get("index", 0))
+            index = self.fan_index(target)
+            fan = self.fans[index]
+            if req.get("pct") is not None:
+                pct = clamp_pct(req.get("pct"))
+            elif req.get("duty") is not None:
+                pct = int(round(max(0, min(fan.period_ns, int(req["duty"]))) * 100.0
+                                / max(1, fan.period_ns)))
+            else:
+                # 只给设备标识不给值：宁可报错，也不要误设转速。
+                return {"ok": False, "error": "set 需要 pct（0–100）或 duty"}
+            res = self.to_manual(index, pct,
+                                 req.get("hold_s", req.get("hold")))
+            # Return truthful mode: global mode is unchanged, instance has override
+            return {"ok": True, "instance_id": fan.id, "index": res["index"], "pct": pct,
+                    "mode": self.mode, "instance_mode": "manual",
+                    "hold_s": res["hold_s"]}
+        if op == "selftest":
+            target = req.get("instance_id", req.get("index"))
+            return self.selftest(self.fan_index(target) if target is not None else None)
+        if op == "enable":
+            # Enable instance by stable id
+            identifier = str(req.get("instance_id") or "")
+            if not identifier:
+                return {"ok": False, "error": "enable requires instance_id"}
+            current_inv = self.inventory.get("instances", [])
+            old = next((item for item in current_inv if item["id"] == identifier), None)
+            if old is None:
+                return {"ok": False, "error": f"不存在风扇实例 {identifier!r}"}
+            if old["enabled"]:
+                return {"ok": True, "instance_id": identifier, "enabled": True, "note": "already enabled"}
+            enabled_instance = {**old, "enabled": True}
+            return self._update_instance(identifier, enabled_instance)
+        if op == "disable":
+            # Disable instance by stable id
+            identifier = str(req.get("instance_id") or "")
+            if not identifier:
+                return {"ok": False, "error": "disable requires instance_id"}
+            current_inv = self.inventory.get("instances", [])
+            old = next((item for item in current_inv if item["id"] == identifier), None)
+            if old is None:
+                return {"ok": False, "error": f"不存在风扇实例 {identifier!r}"}
+            if not old["enabled"]:
+                return {"ok": True, "instance_id": identifier, "enabled": False, "note": "already disabled"}
+            disabled_instance = {**old, "enabled": False}
+            return self._update_instance(identifier, disabled_instance)
+        return {"ok": False, "error": f"不支持的 op：{op!r}（可用 set/get/status/ping/selftest/"
+                                      f"temp/curve/auto/enable/disable）"}
+
+    # -- 状态 --------------------------------------------------------
+    def status(self) -> dict:
+        now = time.monotonic()
+        items = []
+        for f in self.fans:
+            override = self._manual_overrides.get(f.id)
+            if override and override["until"] >= now:
+                control_mode = "manual"
+            else:
+                control_mode = "auto"
+            items.append(f.info(control_mode))
+        return {"ok": True, "mode": self.mode, "temp": read_max_temp(),
+                "curve": [list(r) for r in self.curve],
+                "default_pct": self.default_pct, "period_ns": self.period_ns,
+                "hold_s": self.temp_hold_s,
+                "items": items,
+                "inventory": self.inventory}
+
+
+# ================================================================ socket 服务
+def safe_handle(ctrl: Controller, req: Any) -> dict:
+    """唯一一处把异常翻译成 {"ok":false} 的地方。
+
+    socket / stdin / --once 三条入口都走它，否则总有一天会有一条忘了兜底，
+    然后一个几百行 traceback 把调用方等成超时。
+    """
+    try:
+        if not isinstance(req, dict):
+            return {"api_version": SOCKET_API_VERSION, "ok": False, "code": "invalid_request", "error": "请求必须是 JSON 对象"}
+        return ctrl.handle(req)
+    except (ValueError, RuntimeError) as exc:
+        return {"api_version": SOCKET_API_VERSION, "ok": False, "code": "invalid_request", "error": str(exc)}
+    except Exception as exc:                    # 最后一道闸
+        log.exception("处理请求失败")
+        return {"api_version": SOCKET_API_VERSION, "ok": False, "code": "internal_error", "error": f"内部错误：{exc}"}
+
+
+def bind_socket(path: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(p.parent, 0o750)
+    except OSError:
+        pass
+    if p.exists():
+        try:
+            p.unlink()              # 上次崩溃留下的死 socket
+        except OSError as exc:
+            raise SystemExit(f"删不掉旧 socket {p}：{exc}")
+    os.umask(0o007)
+
+
+def chown_socket(path: str, group: str) -> None:
+    mode = 0o660
+    gid = -1
+    if group:
+        try:
+            if grp is None:
+                raise KeyError(group)
+            gid = grp.getgrnam(group).gr_gid
+        except KeyError:
+            # 指定的组不存在：退回 0600（只有 root 能用），并在日志里喊一声
+            log.error("没有 %s 组：socket 退回 0600（只有 root 能连）。"
+                      "想给普通用户用就建这个组、把用户加进去", group)
+            mode = 0o600
+    else:
+        mode = 0o600                # 没配组：只允许 root
+    try:
+        os.chown(path, 0, gid)
+        os.chmod(path, mode)
+    except OSError as exc:
+        log.error("设置 socket 权限失败：%s", exc)
+
+
+async def serve(ctrl: Controller) -> None:
+    stop = asyncio.Event()
+
+    async def on_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    req = json.loads(line.decode("utf-8", "replace"))
+                except ValueError as exc:
+                    res = {"api_version": SOCKET_API_VERSION, "ok": False, "code": "invalid_request", "error": f"JSON 解析失败：{exc}"}
+                else:
+                    res = safe_handle(ctrl, req)
+                writer.write((json.dumps(res, ensure_ascii=False) + "\n").encode("utf-8"))
+                try:
+                    await writer.drain()
+                except OSError:
+                    break
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    bind_socket(ctrl.socket_path)
+    server = await asyncio.start_unix_server(on_client, path=ctrl.socket_path)
+    chown_socket(ctrl.socket_path, ctrl.group)
+    log.info("监听 %s（socket_enable=true）", ctrl.socket_path)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    async with server:
+        await stop.wait()
+    log.info("退出（风扇保持当前风速）")
+
+
+async def run_service(ctrl: Controller) -> None:
+    ctrl.boot_apply()
+    if ctrl.auto_enable:
+        ctrl.start_auto()
+    if ctrl.socket_enable:
+        await serve(ctrl)
+    else:
+        # 没开 socket：只跑自动温控，靠信号退出
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except (NotImplementedError, RuntimeError):
+                pass
+        await stop.wait()
+    ctrl.stop_auto()
+
+
+# ================================================================ 命令行
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="fanctl", description="RK3566 可配置 PWM 风扇控制（自动温控 + 手动 + 自检）")
+    ap.add_argument("--config", default=str(DEFAULT_CONFIG), help="配置文件路径")
+    ap.add_argument("--serve", action="store_true", help="常驻：自动温控 + socket（systemd 用这个）")
+    ap.add_argument("--auto", action="store_true", help="前台跑自动温控（调试用）")
+    ap.add_argument("--status", action="store_true", help="打印各路风扇状态")
+    ap.add_argument("--selftest", action="store_true", help="全速 1 秒并读转速")
+    ap.add_argument("--set", nargs=2, metavar=("INDEX", "PCT"), help="设置某路转速百分比")
+    ap.add_argument("--stdin", action="store_true", help="从标准输入逐行读 JSON")
+    ap.add_argument("--once", metavar="JSON", help="单条请求，打印应答")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)-7s %(name)s: %(message)s")
+
+    ctrl = Controller(load_config(Path(args.config)))
+
+    euid = getattr(os, "geteuid", lambda: 0)()
+    if euid != 0:
+        # 只读操作（status）不拦，写操作会在 sysfs 上 EACCES 并给出人话
+        log.warning("当前不是 root：多半只能读，改不了 duty（请用 sudo）")
+
+    if args.status:
+        print(json.dumps(ctrl.status(), ensure_ascii=False, indent=2))
+        return 0
+    if args.selftest:
+        print(json.dumps(ctrl.selftest(), ensure_ascii=False, indent=2))
+        return 0
+    if args.set:
+        idx, pct = args.set
+        try:
+            res = ctrl.to_manual(int(idx), clamp_pct(pct))
+        except (ValueError, RuntimeError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+            return 2
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
+    if args.once:
+        try:
+            req = json.loads(args.once)
+        except ValueError as exc:
+            print(json.dumps({"ok": False, "error": f"JSON 解析失败：{exc}"}, ensure_ascii=False))
+            return 2
+        print(json.dumps(safe_handle(ctrl, req), ensure_ascii=False, indent=2))
+        return 0
+    if args.stdin:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except ValueError as exc:
+                res = {"ok": False, "error": f"JSON 解析失败：{exc}"}
+            else:
+                res = safe_handle(ctrl, req)
+            print(json.dumps(res, ensure_ascii=False), flush=True)
+        return 0
+    if args.auto:
+        print(json.dumps(ctrl.status(), ensure_ascii=False, indent=2))
+        try:
+            asyncio.run(_auto_only(ctrl))
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+    # 默认 = --serve
+    asyncio.run(run_service(ctrl))
+    return 0
+
+
+async def _auto_only(ctrl: Controller) -> None:
+    """前台自动温控（不开 socket）。"""
+    ctrl.boot_apply()
+    ctrl.start_auto()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+    await stop.wait()
+    ctrl.stop_auto()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(0)

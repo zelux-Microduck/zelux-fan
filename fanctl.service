@@ -1,0 +1,44 @@
+[Unit]
+Description=Fan control daemon (auto PWM thermal control for RK3566)
+Documentation=file:///usr/local/bin/fanctl
+# 尽早起来：主控在无人看管的头十几秒里也能上 80℃。
+After=local-fs.target
+Conflicts=zelux-fand.service
+Before=multi-user.target
+
+[Service]
+Type=simple
+# 必须是 root：/sys/class/pwm 只有 root 能写，这个助手也只做「读温度 → 写 duty」。
+User=root
+ExecStart=/usr/local/bin/fanctl --serve --config /etc/fanctl.toml
+# Runtime inventory is owned by the service; the unprivileged client never writes it directly.
+StateDirectory=fanctl
+StateDirectoryMode=0750
+# RuntimeDirectory 归 root:root 0750，socket 由 fanctl 自己 chmod（默认 0600）
+RuntimeDirectory=fanctl
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+# 退出时不要把风扇关掉：主控断电前后那几秒正是最热的时候
+KillSignal=SIGTERM
+
+# ---- 加固：能收紧的都收紧，缩小这个 root 进程的权限面 ----
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+# ⚠ 注意：这里**不能**用 ProtectKernelTunables=yes —— 它会把 /sys 整体变只读，
+# PWM 就写不进去了。ProtectSystem=full 只锁 /usr /boot /etc，不影响 /sys。
+ProtectSystem=full
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,88 @@
+# ============================================================
+# fanctl 配置文件（Radxa Zero 3W / RK3566 PWM 风扇实例）
+# ------------------------------------------------------------
+# 改完必须重启服务才生效：  sudo systemctl restart fanctl
+# 语法是 TOML：字符串用双引号，整数不要加引号。
+#
+# `[[fan.channel]]` 有几段就管理几个实例；每个实例需要唯一 id。
+# 本文件里的引脚表是旧版参考配置，迁移到目标设备前必须按实际接线核验。
+# ============================================================
+
+[fan]
+# Fresh installs do not guess fan count or pins. Add verified instances in Studio.
+# Existing deployed channel configuration is preserved and migrated on upgrade.
+channel = []
+# unix socket 路径。远程/网页控制走它；不用远程控制可以关（见 socket_enable）。
+socket = "/run/fanctl/fan.sock"
+inventory_file = "/var/lib/fanctl/inventory.json"
+
+# 是否开 socket。false = 只跑自动温控，不监听任何端口（最安全）。
+socket_enable = true
+
+# socket 归属的组。留空 = 只有 root 能连（0600）。
+# 想让普通用户/服务能调风扇，就建个组（如 gpio）填进来，再把用户加进去。
+socket_group = ""
+
+# PWM 周期，纳秒。40000 ns = 25 kHz。
+# ⚠ 如果这颗 PWM 还兼着别的东西（比如某些舵机对低频很敏感），别乱改。
+period_ns = 40000
+
+# 开机先给的安全风速（%）。之后自动温控会按温度接管。
+default_pct = 60
+
+# 自动温控总开关。false = 只手动。
+auto = true
+
+# 手动调速后，多少秒自动交回温控曲线。0 = 一直保持手动（不推荐）。
+temp_hold_s = 120
+
+# 4pin 风扇每转脉冲数。转速读数整体差 2 倍就改这里（有的风扇是 1 或 4）。
+pulses_per_rev = 2
+
+
+# ------------------------------------------------------------
+# 温控曲线：温度升到某个值，就至少给到对应的转速。
+# 判据是「温度 >= 台阶温度就套那一档」；都不满足时走 default_pct（60%）。
+# 温度取所有 thermal_zone 里最高的那个。
+# ------------------------------------------------------------
+[fan.curve]
+points = [[58, 70], [64, 85], [70, 100]]
+# 读法：<58℃ 60%（默认）｜≥58℃ 70%｜≥64℃ 85%｜≥70℃ 100%
+
+
+# ------------------------------------------------------------
+# 风扇实例。几颗就写几段 [[fan.channel]]。
+#
+# 字段说明：
+#   name    只用于显示
+#   pwm     内核全局 PWM 号（配置里的主键，解析顺序第一位）
+#   gpio    这颗 PWM 对应的 GPIO 全局号（仅记录，便于对照）
+#   tach    测速 GPIO 全局号；没有测速线就写 0（会显示 rpm=null，不猜）
+#   chip    pwmchip 的编号（/sys/class/pwm/pwmchipN 的 N）
+#   channel chip 内的通道偏移（该 chip 下 pwmM 的 M）
+#
+# ⚠ chip/channel 是「sysfs 里的真实位置」，不是全局号，各家设备树不一定一样。
+#   不确定就先写 -1/-1 —— fanctl 只会用内核已经导出的通道，**绝不会去 export 错脚**。
+#   fanctl 只使用已预先导出的 PWM 通道，不会 export 或 unexport PWM。
+#   真机确认方法见 README「先确认通道路径」一节。
+# ------------------------------------------------------------
+
+# 风扇 1：PWM14 / GPIO3_C4（全局 116），2pin，没有测速线
+# [[fan.channel]]
+# id = "cooling-top"
+# name = "顶部风扇"
+# pwm = 14
+# gpio = 116
+# tach = 0
+# chip = 3
+# channel = 2
+
+# 风扇 2：PWM12 / GPIO4_C6（全局 149，丝印 GPIO4_C6/PIN_24），4pin，测速 GPIO150
+# [[fan.channel]]
+# id = "cooling-main"
+# name = "主板散热"
+# pwm = 12
+# gpio = 149
+# tach = 150
+# chip = 3
+# channel = 0
