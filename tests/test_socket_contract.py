@@ -27,6 +27,9 @@ class SocketContractTests(unittest.TestCase):
         self._pwm_patch = patch.object(fanctl, "PWM_ROOT", root)
         self._pwm_patch.start()
         self.addCleanup(self._pwm_patch.stop)
+        self._pin_gate_patch = patch.object(fanctl.Controller, "_validate_physical_pin", return_value=None)
+        self._pin_gate_patch.start()
+        self.addCleanup(self._pin_gate_patch.stop)
         self.controller = fanctl.Controller({"fan": {
             "inventory_file": str(Path(self._tmp.name) / "inventory.json"),
             "channel": [{
@@ -667,8 +670,8 @@ class SocketContractTests(unittest.TestCase):
             # Cleanup
             fanctl._TACH_EXPORTED_BY_US.discard(gpio_num)
 
-    def test_pwm_never_exported_only_uses_preexported(self) -> None:
-        """fanctl must never export PWM channels; only use pre-exported paths."""
+    def test_low_level_apply_does_not_silently_export_uninitialized_pwm(self) -> None:
+        """Low-level duty writes do not bypass the explicit activation/export lifecycle."""
         with tempfile.TemporaryDirectory() as tmp:
             pwm_root = Path(tmp) / "sys-pwm"
             pwm_root.mkdir()
@@ -688,9 +691,10 @@ class SocketContractTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as ctx:
                     controller = fanctl.Controller(config)
                     controller.fans[0].apply(24000)
-                # Should mention not pre-exported
+                # The low-level apply call reports the missing channel.
                 self.assertIn("PWM", str(ctx.exception))
-                # Export should NOT have been called
+                # Export is performed explicitly by instance activation/boot_apply,
+                # never as a side effect of an arbitrary duty write.
                 self.assertEqual((chip_dir / "export").read_text(), "")
 
     def test_per_instance_manual_override_isolation(self) -> None:

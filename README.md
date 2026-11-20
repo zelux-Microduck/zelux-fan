@@ -2,7 +2,7 @@
 
 > 2026-11-18 集成说明：在 ZELUX Device Image 中，请仅使用 zelux-fand.service；规范组件路径为 /opt/zelux/current/software/zelux-fan/fanctl，TOML 为 /etc/zelux/zelux.toml，socket 为 /run/zelux/fan.sock，实例清单为 /var/lib/zelux-fan/inventory.json。下面的独立 install.sh/fanctl.service 是非镜像环境入口，与镜像服务互斥。
 >
-> 当前服务只使用已预导出的 PWM，不自动 export/unexport；禁用和删除停止输出但保留 PWM 节点。预导出流程和实际接线必须由板级部署确认。set 只覆盖指定实例，其他风扇继续温控；全局 mode 保持 auto，实例 control_mode 显示手动覆盖，auto 清除全部覆盖，重启恢复自动。curve 更新持久化。新增 enable/disable 操作用稳定 instance_id；delete 必须 confirm=true。无测速时自检为未知，不能当作通过。
+> 当前 zelux-fand 是 PWM/FG 唯一运行时控制者：创建/启用实例时按需 export PWM；它持久记录自己创建的 export，禁用/删除时只 unexport 自己拥有的通道，预先由系统或用户 export 的通道不会被释放。物理 PWM 控制器及 pinmux 必须先由板级设备树启用；Studio 的受限 setup 流程负责受支持档案的 overlay 配置，但不控制 PWM duty。set 只覆盖指定实例，其他风扇继续温控；全局 mode 保持 auto，实例 control_mode 显示手动覆盖，auto 清除全部覆盖，重启恢复自动。curve 更新持久化。新增 enable/disable 操作用稳定 instance_id；delete 必须 confirm=true。无测速时自检为未知，不能当作通过。
 >
 > 本地代码已完成本轮回归；尚未进行设备及浏览器验收，fan 仓库仍为 local-snapshot，未正式发布。
 
@@ -46,11 +46,9 @@
 | 风扇数量 | 配置实例数决定；每个实例使用唯一稳定 ID |
 | PWM 参数 | 每实例配置 period；常见值 40000 ns（25 kHz），必须按风扇/板卡确认 |
 
-> ⚠ 前提：**设备树里所配置的 PWM 通道得先 probe 出来**（`/sys/class/pwm/` 下能看到 `pwmchipN`）。
-> Armbian 一般靠 overlay 开 PWM，具体怎么开取决于你的镜像。
-> fanctl 只负责"往已经出现的通道写值"，**不替你改设备树**。
-> **fanctl 不会 export PWM 通道** —— 只使用内核或设备树已经预先导出的通道，避免误控错误引脚。
-> 装完先看 `ls /sys/class/pwm/pwmchipN/` 看有没有已经导出的 `pwmM` 目录。
+> ⚠ 前提：设备树须先启用物理引脚的 PWM 功能，使对应 PWM 控制器注册为 `/sys/class/pwm/pwmchipN`。Armbian 一般通过 overlay 启用 PWM。
+> `zelux-pwm-setupd` 只在受支持的板卡/系统 profile 中通过 Studio 确认后更新 allowlisted overlay 配置，并要求重启及运行设备树验证；它不 export/unexport PWM、不写 duty。
+> 只有 pinmux 和 PWM 控制器验证就绪后，fanctl 才可按物理引脚档案映射创建实例，并在实例激活时 export 对应通道。不要手工猜 `pwmchipN/channel`；优先从 Studio 选择已验证的物理引脚。
 
 ---
 
@@ -160,7 +158,7 @@ sudo fanctl --set 0 80    # 第 0 路手动 80%（120 秒后自动交回温控�
 
 ### 5.1 先确认通道路径
 
-`--status` 里 `path` 是 `null`，说明 chip/channel 猜错了。查：
+对于 Studio/Device Agent 管理的实例，应在实例表单选择设备端验证就绪的物理引脚，由设备档案提供 chip/channel 映射。不要照抄其他设备的编号。只有独立运行 fanctl、没有板级 setup helper 时，才需要手工确认 `/sys/class/pwm/` 中的 controller 与 channel：
 
 ```bash
 ls /sys/class/pwm/                 # 有哪些 pwmchip
@@ -170,8 +168,7 @@ ls /sys/class/pwm/pwmchip3/        # 看里面已经导出了哪些 pwmM
 
 `chip` = `pwmchip` 后面的数字；`channel` = `pwm` 后面的数字。
 
-> **不确定就两个都写 `-1`。** 那样 fanctl 只用内核已经导出的通道，**绝不会去 export 错脚**
-> —— 控制错脚比控制不了更糟（可能把别的外设拧了）。
+> 不确定时不要创建或启用实例。fanctl 的显式 chip/channel 必须与已验证物理引脚映射一致；它会检查映射、按需 export 以及只释放自己登记的资源，不会通过猜测切换到其他通道。
 
 ### 5.2 常用参数
 

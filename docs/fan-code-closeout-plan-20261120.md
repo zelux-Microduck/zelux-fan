@@ -3,6 +3,8 @@
 日期：2026-11-20（覆盖 11 月 19 日夜间至 20 日凌晨的问题）
 状态：软件收口及本地模拟回归已完成，等待真机统一验收；工作区尚未提交、推送或部署。
 
+> 后续架构更新（2026-11-20）：本计划中“fanctl 只使用已预导出 PWM、不 export/unexport”的边界已被 PWM 物理引脚 onboarding 方案取代。当前职责与生命周期以 [pwm-pin-onboarding-20261120.md](pwm-pin-onboarding-20261120.md) 为准：受控 setup helper 负责 overlay，fanctl 负责实例激活时 export 及只释放自身拥有的通道。本文件保留为当时问题收口记录，不作为当前运行行为规范。
+
 ## 1. 收口目标与边界
 
 保持解耦架构：Studio → Device Agent → 独立驱动客户端 → fanctl → PWM/FG。

@@ -17,11 +17,11 @@ fanctl 以 root 常驻，对外只暴露一行 JSON 的 socket，攻击面就是
 不需要远程控制的话，socket 可以关掉（配置 `socket_enable = false`），只在命令行用。
 
 硬件前提（Radxa Zero 3W 实测，别按"常见接法"改）：
-* 风扇 1：PWM14 / GPIO3_C4（全局 116），**没有测速线**，只能调速；
-* 风扇 2：PWM12 / GPIO149 调速 + GPIO150 测速（4pin 带 tach）；
-* 两颗都是 period=40000ns / 25 kHz / normal polarity，duty 0–40000。
-* 前提：设备树里 PWM 通道得先 probe 出来（Armbian 一般开 `rk3566-pwm` 那类 overlay，
-  或用你的板子厂家提供的方式）。fanctl 只负责"往已经出现的通道写值"，不替你改设备树。
+* PWM 物理引脚、控制器和可选 FG GPIO 由设备档案/实例配置提供，不预设双风扇或固定接线；
+* 常见 period=40000ns / 25 kHz，须按实际风扇规格配置。
+* 前提：设备树先启用目标引脚 pinmux 并注册 PWM controller。受支持的 Studio setup helper
+  可管理经 allowlist 校验的 overlay 启用流程；fanctl 不修改设备树，只在实例激活时 export
+  已验证映射的 PWM channel，并只释放自己记录所有权的通道。
 
 命令行用法：
     sudo fanctl --serve                 # 常驻：自动温控 + 可选 socket（systemd 用这个）
@@ -36,16 +36,30 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
 import math
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+
+def is_zero3w(model: str, compatible: list[str]) -> bool:
+    """Recognize upstream and legacy Armbian DT identities, never a generic SoC."""
+    name = "".join(c for c in model.lower() if c.isalnum())
+    ids = {c.lower() for c in compatible}
+    if "radxazero3e" in name or any("zero3e" in c.replace("-", "") for c in ids):
+        return False
+    boards = {"radxa,zero3", "radxa,zero3-aic8800ds2", "radxa,zero-3w"}
+    if ids:
+        return "rockchip,rk3566" in ids and bool(ids & boards)
+    return name == "radxazero3w"
 
 try:                                  # grp 只有 Unix 有；没有它只是设不了 socket 的组
     import grp
@@ -73,6 +87,62 @@ MAX_TEMP_SANE = 150.0               # 超过这个数当作读错了，忽略
 log = logging.getLogger("fanctl")
 SOCKET_API_VERSION = 1
 _TACH_EXPORTED_BY_US: set[int] = set()
+_PWM_EXPORTED_BY_US: set[tuple[int, int]] = set()
+_PWM_OWNERSHIP_FILE = Path(os.environ.get("FANCTL_PWM_OWNERSHIP_FILE", "/var/lib/fanctl/pwm-owned.json"))
+try:
+    _owned_pwm_rows = json.loads(_PWM_OWNERSHIP_FILE.read_text("utf-8"))
+    if isinstance(_owned_pwm_rows, list):
+        _PWM_EXPORTED_BY_US.update((int(row[0]), int(row[1])) for row in _owned_pwm_rows
+                                   if isinstance(row, list) and len(row) == 2
+                                   and 0 <= int(row[0]) <= 255 and 0 <= int(row[1]) <= 255)
+except (OSError, ValueError, TypeError, IndexError):
+    pass
+
+
+def _persist_pwm_ownership() -> None:
+    _PWM_OWNERSHIP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".pwm-owned.", dir=str(_PWM_OWNERSHIP_FILE.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(sorted([list(key) for key in _PWM_EXPORTED_BY_US])))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, _PWM_OWNERSHIP_FILE)
+        if os.name == "posix":
+            dir_fd = os.open(_PWM_OWNERSHIP_FILE.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _pinmux_active(function: str) -> bool:
+    """Confirm the running DT controller references the expected pin group."""
+    symbols = {"PWM12_M1": ("pwm12", "pwm12m1_pins"),
+               "PWM13_M1": ("pwm13", "pwm13m1_pins")}
+    pair = symbols.get(function)
+    if not pair:
+        return False
+    tree = Path("/proc/device-tree")
+    try:
+        paths = [(tree / "__symbols__" / name).read_bytes().decode("ascii").strip("\0\n")
+                 for name in pair]
+        if any(not p.startswith("/") or ".." in Path(p).parts for p in paths):
+            return False
+        controller, group = (tree / p.lstrip("/") for p in paths)
+        status = (controller / "status").read_bytes().decode("ascii").strip("\0\n")
+        refs = (controller / "pinctrl-0").read_bytes()
+        phandle = (group / "phandle").read_bytes()
+        names = (controller / "pinctrl-names").read_bytes().decode("ascii").split("\0")
+        return status in ("okay", "ok") and "active" in names and len(phandle) == 4 and phandle in refs
+    except OSError:
+        return False
 
 
 class FanBusyError(RuntimeError):
@@ -322,6 +392,7 @@ class PwmChannel:
         self.tach = clamp_int(spec.get("tach"), 0, 65535, 0)
         self.chip = clamp_int(spec.get("chip"), -1, 255, -1)
         self.channel = clamp_int(spec.get("channel"), -1, 255, -1)
+        self.pin_id = str(spec.get("pin_id") or "")
         self.period_ns = period_ns
         self.pulses_per_rev = clamp_int(spec.get("pulses_per_rev"), 1, 16, PULSES_PER_REV)
         self._path: Path | None = None
@@ -339,18 +410,14 @@ class PwmChannel:
             return self._path
         self._path = None
         if self.chip >= 0 and self.channel >= 0:
-            # Use pre-exported PWM channels only; fanctl never exports PWM
             chip_path = PWM_ROOT / f"pwmchip{self.chip}"
             node = chip_path / f"pwm{self.channel}"
             if node.exists():
-                self._exported_by_us = False
+                self._exported_by_us = (self.chip, self.channel) in _PWM_EXPORTED_BY_US
                 self._path = node
                 return self._path
-            self._why = (f"{self.name}: PWM channel pwmchip{self.chip}/pwm{self.channel} not pre-exported. "
-                         f"fanctl only uses already-exported PWM channels. "
-                         f"Check device tree or kernel PWM overlay configuration.")
+            self._why = f"{self.name}: PWM channel pwmchip{self.chip}/pwm{self.channel} is not exported"
             return None  # Explicit mapping must never fall back to another chip.
-            return None  # Fail fast: chip/channel configured but not pre-exported
         if self.pwm >= 0:
             for chip in self._chips():
                 direct = chip / f"pwm{self.pwm}"
@@ -374,6 +441,74 @@ class PwmChannel:
                 continue
         return [p for _, p in sorted(chips)]
 
+    def export(self) -> Path:
+        """Export the configured channel, tracking only exports initiated by fanctl."""
+        if self.chip < 0 or self.channel < 0:
+            raise RuntimeError(f"{self.name}: PWM chip/channel mapping is required")
+        chip = PWM_ROOT / f"pwmchip{self.chip}"
+        node = chip / f"pwm{self.channel}"
+        if not chip.is_dir():
+            raise RuntimeError(f"{self.name}: pwmchip{self.chip} is not registered")
+        owned = (self.chip, self.channel) in _PWM_EXPORTED_BY_US
+        if not node.exists():
+            try:
+                npwm = int((chip / "npwm").read_text("ascii").strip())
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"{self.name}: cannot read pwmchip{self.chip}/npwm: {exc}") from None
+            if self.channel >= npwm:
+                raise RuntimeError(f"{self.name}: PWM channel {self.channel} is outside npwm={npwm}")
+            try:
+                (chip / "export").write_text(str(self.channel), "ascii")
+            except OSError as exc:
+                if not node.exists():
+                    raise RuntimeError(f"{self.name}: cannot export PWM channel: {exc}") from None
+            else:
+                owned = True
+                _PWM_EXPORTED_BY_US.add((self.chip, self.channel))
+                try:
+                    _persist_pwm_ownership()
+                except OSError as exc:
+                    try:
+                        (chip / "unexport").write_text(str(self.channel), "ascii")
+                    except OSError as cleanup_exc:
+                        # Keep in-memory ownership so a later release can retry cleanup.
+                        self._exported_by_us = True
+                        self._path = node
+                        raise RuntimeError(f"{self.name}: ownership ledger failed ({exc}) and rollback unexport failed ({cleanup_exc})") from None
+                    _PWM_EXPORTED_BY_US.discard((self.chip, self.channel))
+                    raise RuntimeError(f"{self.name}: cannot persist PWM export ownership: {exc}") from None
+            deadline = time.monotonic() + 1.0
+            while not node.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+        if not node.is_dir():
+            raise RuntimeError(f"{self.name}: exported PWM sysfs node did not appear")
+        self._exported_by_us = owned
+        self._path = node
+        return node
+
+    def unexport_owned(self) -> bool:
+        key = (self.chip, self.channel)
+        if not self._exported_by_us or key not in _PWM_EXPORTED_BY_US:
+            return False
+        _PWM_EXPORTED_BY_US.discard(key)
+        try:
+            _persist_pwm_ownership()
+        except OSError as exc:
+            _PWM_EXPORTED_BY_US.add(key)
+            raise RuntimeError(f"{self.name}: cannot persist PWM release ownership: {exc}") from None
+        try:
+            (PWM_ROOT / f"pwmchip{self.chip}" / "unexport").write_text(str(self.channel), "ascii")
+        except OSError as exc:
+            _PWM_EXPORTED_BY_US.add(key)
+            try:
+                _persist_pwm_ownership()
+            except OSError:
+                pass
+            raise RuntimeError(f"{self.name}: cannot unexport owned PWM: {exc}") from None
+        self._exported_by_us = False
+        self._path = None
+        return True
+
     # -- 读写 --------------------------------------------------------
     def _write(self, name: str, value: int) -> None:
         node = self.path()
@@ -389,7 +524,10 @@ class PwmChannel:
         duty = max(0, min(period, int(duty)))
         # 顺序有讲究：enable=1 时改 period 有些内核直接 EBUSY，
         # 而 duty > period 写 period 会被 EINVAL 顶回来，所以先把 enable 关掉。
-        self._write("enable", 0)
+        # Freshly exported disabled channels may have period=0; even enable=0
+        # can then be rejected. Skip only on positively read kernel state.
+        if not (self._read_int("period", -1) == 0 and self._read_int("enable", -1) == 0):
+            self._write("enable", 0)
         # 必须读**内核里真实的** period 来比：刚 export 的通道 period 是 0，
         # 此时只写 duty 会被内核拒掉（EINVAL），风扇一动不动还看不出为什么。
         current_period = self._read_int("period", 0)
@@ -415,9 +553,7 @@ class PwmChannel:
             return result
 
     def _release_resources(self) -> dict:
-        """Stop driving this instance (duty=0, enable=0) but never unexport PWM.
-
-        fanctl never unexports PWM channels because it never exports them.
+        """Stop output and unexport only a channel this process exported.
         Only tach GPIOs that were exported by this service (via measure_hz)
         are unexported on release.
         """
@@ -427,7 +563,8 @@ class PwmChannel:
         # Stop PWM: duty=0, enable=0
         if node is not None:
             try:
-                (node / "enable").write_text("0", "ascii")
+                if not (self._read_int("period", -1) == 0 and self._read_int("enable", -1) == 0):
+                    (node / "enable").write_text("0", "ascii")
                 if self._read_int("period", 0) > 0:
                     (node / "duty_cycle").write_text("0", "ascii")
             except OSError as exc:
@@ -445,7 +582,10 @@ class PwmChannel:
                 return {"ok": False, "resource": resource, "error": str(exc)}
             else:
                 return {"ok": False, "resource": resource, "error": "PWM state cannot be confirmed"}
-        # Never unexport PWM - fanctl only uses pre-exported channels
+        try:
+            unexported = self.unexport_owned()
+        except RuntimeError as exc:
+            return {"ok": False, "resource": resource, "error": str(exc), "resources": released}
         if self.tach:
             # Query module set for actual ownership - only GPIO we exported via measure_hz is owned by us
             tach_release = release_tach_gpio(self.tach, owned=None)
@@ -457,7 +597,7 @@ class PwmChannel:
         self._exported_by_us = False
         self._duty = 0
         released.append({"ok": True, "resource": resource, "stopped": True,
-                         "unexported": False, **({"missing": True} if node is None else {})})
+                         "unexported": unexported, **({"missing": True} if node is None else {})})
         return {"ok": True, "resources": released}
 
     def _read_int(self, name: str, default: int = 0) -> int:
@@ -690,9 +830,87 @@ class Controller:
         pwm = instance["pwm"]
         return {"id": instance["id"], "name": instance["name"], "pwm": -1,
                 "chip": pwm["chip"], "channel": pwm["channel"],
+                "pin_id": instance.get("pwm_pin") or "",
                 "tach": instance.get("tach_gpio") or 0,
                 "period_ns": instance["period_ns"],
                 "pulses_per_rev": instance.get("pulses_per_rev", PULSES_PER_REV)}
+
+    @staticmethod
+    def _pwm_readiness() -> dict:
+        # RK3566 physical pin mappings are tied to controller MMIO identity,
+        # never to unstable pwmchip enumeration order.
+        profile = {
+            "id": "radxa-zero3w-rk3566-pwm.v1",
+            "pins": [
+                {"id": "radxa-zero3w-pin21-pwm12-m1", "label": "pin 21 · PWM12_M1",
+                 "pin": 21, "function": "PWM12_M1", "gpio": 149,
+                 "device": "fe700010.pwm", "channel": 0},
+                {"id": "radxa-zero3w-pin24-pwm13-m1", "label": "pin 24 · PWM13_M1",
+                 "pin": 24, "function": "PWM13_M1", "gpio": 150,
+                 "device": "fe700010.pwm", "channel": 0},
+            ]}
+        controllers = []
+        mapped = []
+        try:
+            for chip in sorted(PWM_ROOT.glob("pwmchip*"), key=lambda p: int(p.name[7:])):
+                device = (chip / "device").resolve()
+                of_node = (chip / "device" / "of_node").resolve()
+                try:
+                    of_name = (of_node / "name").read_bytes().decode("ascii", "ignore").strip("\0").lower()
+                except OSError:
+                    of_name = of_node.name.lower()
+                controllers.append({"chip": int(chip.name[7:]), "device": device.name,
+                                    "of_node": str(of_node), "of_name": of_name,
+                                    "npwm": int((chip / "npwm").read_text("ascii").strip())})
+            for pin in profile["pins"]:
+                symbol = "pwm12" if pin["function"] == "PWM12_M1" else "pwm13"
+                try:
+                    rel = (Path("/proc/device-tree/__symbols__") / symbol).read_bytes().decode("ascii").strip("\0\n")
+                    expected_node = (Path("/proc/device-tree") / rel.lstrip("/")).resolve()
+                except OSError:
+                    expected_node = None
+                controller = next((c for c in controllers if expected_node is not None
+                                   and c["of_node"] == str(expected_node)), None)
+                entry = {**pin, "device": controller["device"] if controller else None,
+                         "chip": controller["chip"] if controller else None,
+                         "ready": bool(controller and pin["channel"] < controller["npwm"]
+                                       and _pinmux_active(pin["function"])),
+                         "registered": controller is not None,
+                         "exported": bool(controller and (PWM_ROOT / f"pwmchip{controller['chip']}" / f"pwm{pin['channel']}").exists()),
+                         "pinctrl_active": _pinmux_active(pin["function"])}
+                mapped.append(entry)
+        except (OSError, ValueError, IndexError):
+            return {"profile": profile["id"], "state": "unknown", "controllers": [],
+                    "mapped_pins": [], "reason": "无法可靠读取 PWM 控制器映射"}
+        try:
+            board = Path("/proc/device-tree/model").read_bytes().decode("utf-8", "replace").strip("\0\n ")
+        except OSError:
+            board = ""
+        try:
+            compatible = [v for v in Path("/proc/device-tree/compatible").read_bytes().decode(
+                "utf-8", "replace").strip("\0").split("\0") if v]
+        except OSError:
+            compatible = []
+        supported_board = is_zero3w(board, compatible)
+        if not supported_board:
+            for pin in mapped:
+                pin["ready"] = False
+        ready_count = sum(1 for pin in mapped if pin["ready"] and pin["registered"])
+        if not supported_board:
+            state = "unsupported_board"
+            reason = f"未识别 Radxa Zero 3W 板卡档案；不会猜测 PWM 引脚映射（model={board!r}, compatible={compatible!r}）"
+        elif ready_count:
+            state = "runtime_available"
+            reason = "至少一个 PWM 物理引脚的控制器与 pinmux 已就绪；fanctl 会在启用实例时 export"
+        else:
+            state = "overlay_required"
+            reason = "板卡可识别，但所选 PWM 控制器/通道未就绪；需要启用匹配的设备树配置并重启"
+        return {"profile": profile["id"], "board": board.strip(), "state": state,
+                "compatible": compatible,
+                "controllers": controllers, "channels": [], "mapped_pins": mapped,
+                "overlay_supported": False,
+                "hint": "控制器注册不等于物理引脚 pinmux 生效；需完成受控配置后才能创建实例" if not ready_count else "",
+                "reason": reason}
 
     def _legacy_inventory(self, specs: list[dict]) -> dict:
         instances = []
@@ -719,6 +937,10 @@ class Controller:
             raise ValueError("default_pct must be an integer from 0 to 100")
         if not isinstance(value.get("curve"), list) or not isinstance(value.get("instances"), list):
             raise ValueError("fan curve and instances must be arrays")
+        physical_gpios = {"radxa-zero3w-pin21-pwm12-m1": 149,
+                          "radxa-zero3w-pin24-pwm13-m1": 150}
+        pwm_gpios = {physical_gpios[item.get("pwm_pin")] for item in value["instances"]
+                     if isinstance(item, dict) and item.get("pwm_pin") in physical_gpios}
         for point in value["curve"]:
             if (not isinstance(point, list) or len(point) != 2
                     or not isinstance(point[0], (int, float)) or not -10 <= point[0] <= 120
@@ -763,6 +985,8 @@ class Controller:
             gpio = item.get("tach_gpio")
             if gpio is not None:
                 gpio = int(gpio)
+                if gpio in pwm_gpios:
+                    raise FanBusyError(f"fan {identifier}: 测速 GPIO{gpio} 与 PWM 物理引脚冲突，请选择独立 FG 引脚或留空")
                 if not 0 <= gpio <= 65535 or gpio in tach:
                     raise FanBusyError(f"fan {identifier}: tach GPIO is invalid or already assigned")
                 tach.add(gpio)
@@ -793,13 +1017,29 @@ class Controller:
     def _make_instance(self, instance: dict) -> PwmChannel | None:
         if not instance["enabled"]:
             return None
+        self._validate_physical_pin(instance)
         spec = self._instance_spec(instance)
         channel = PwmChannel(spec, spec["period_ns"])
-        if channel.path() is None:
-            raise FanBusyError(channel._why or f"{instance['id']}: PWM resource is unavailable")
+        try:
+            channel.export()
+        except RuntimeError as exc:
+            raise FanBusyError(str(exc)) from None
         # Tach ownership is tracked via _TACH_EXPORTED_BY_US module set after successful export in measure_hz.
         # Do NOT infer ownership here based on GPIO existence - preexisting GPIO is not owned by us.
         return channel
+
+    def _validate_physical_pin(self, instance: dict) -> None:
+        pin_id = instance.get("pwm_pin")
+        mapping = instance.get("pwm")
+        if not isinstance(pin_id, str) or not isinstance(mapping, dict):
+            raise FanBusyError("必须选择已验证就绪的物理 PWM 引脚")
+        readiness = self._pwm_readiness()
+        pin = next((item for item in readiness.get("mapped_pins", [])
+                    if item.get("id") == pin_id), None)
+        if not pin or pin.get("ready") is not True:
+            raise FanBusyError("所选 PWM 物理引脚尚未通过运行设备树/pinmux 验证")
+        if mapping.get("chip") != pin.get("chip") or mapping.get("channel") != pin.get("channel"):
+            raise FanBusyError("PWM chip/channel 与物理引脚档案不一致，请刷新设备状态")
 
     def _create_instance(self, instance: Any) -> dict:
         with self._inventory_lock:
@@ -1169,6 +1409,11 @@ class Controller:
             self.default_pct, curve_pct(read_max_temp(), self.curve, self.default_pct))
         for fan in self.fans:
             try:
+                if fan.pin_id:
+                    self._validate_physical_pin({"pwm_pin": fan.pin_id,
+                                                 "pwm": {"chip": fan.chip, "channel": fan.channel}})
+                if fan.path() is None:
+                    fan.export()
                 fan.apply(pct_to_duty(safe, fan.period_ns))
                 log.info("%s -> %d%%（开机兜底）", fan.name, safe)
             except Exception as exc:
@@ -1263,6 +1508,8 @@ class Controller:
             return {"ok": True, "pong": True, "fans": len(self.fans), "mode": self.mode}
         if op == "status":
             return self.status()
+        if op == "pwm_readiness":
+            return {"ok": True, "pwm_readiness": self._pwm_readiness()}
         if op == "validate":
             inventory = req.get("inventory")
             self._validate_inventory(inventory)
