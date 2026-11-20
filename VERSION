@@ -1,6 +1,6 @@
 name: zelux-fan
-version: 1.1.0
-date: 2026-11-18
+version: 1.1.1
+date: 2026-11-20
 desc: RK3566 (Radxa Zero 3W) 可配置 PWM 风扇实例控制（自动温控 + 手动 + 自检 + socket API v1）
 deps: 无（只用 Python 标准库）
 python: ">=3.9（3.11+ 用 tomllib；以下用内置极简解析器）"

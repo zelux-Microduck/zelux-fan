@@ -329,6 +329,9 @@ class PwmChannel:
         self._tach_exported_by_us = False
         self._duty = 0
         self._why = ""
+        self._sample_lock = threading.RLock()
+        self._retired = False
+        self._rpm_sample: tuple[int | None, float | None, str] = (None, None, "not_sampled")
 
     # -- 解析 --------------------------------------------------------
     def path(self) -> Path | None:
@@ -386,22 +389,32 @@ class PwmChannel:
         duty = max(0, min(period, int(duty)))
         # 顺序有讲究：enable=1 时改 period 有些内核直接 EBUSY，
         # 而 duty > period 写 period 会被 EINVAL 顶回来，所以先把 enable 关掉。
-        try:
-            self._write("enable", 0)
-        except RuntimeError:
-            pass
+        self._write("enable", 0)
         # 必须读**内核里真实的** period 来比：刚 export 的通道 period 是 0，
         # 此时只写 duty 会被内核拒掉（EINVAL），风扇一动不动还看不出为什么。
-        if self._read_int("period", 0) != period:
-            self._write("duty_cycle", 0)
+        current_period = self._read_int("period", 0)
+        if current_period != period:
+            if current_period > 0:
+                self._write("duty_cycle", 0)
             self._write("period", period)
         self.period_ns = period
         self._write("duty_cycle", duty)
         self._write("enable", 1)
         self._duty = duty
+        self._retired = False
         return duty
 
     def release(self) -> dict:
+        # Wait for a bounded in-flight FG sample before releasing its GPIO.
+        # Once retired, queued samplers must never export the input again.
+        with self._sample_lock:
+            result = self._release_resources()
+            if result.get("ok"):
+                self._retired = True
+                self._rpm_sample = (None, None, "disabled")
+            return result
+
+    def _release_resources(self) -> dict:
         """Stop driving this instance (duty=0, enable=0) but never unexport PWM.
 
         fanctl never unexports PWM channels because it never exports them.
@@ -410,16 +423,28 @@ class PwmChannel:
         """
         node = self.path()
         resource = f"pwmchip{self.chip}/pwm{self.channel}"
-        if node is None:
-            return {"ok": False, "resource": resource,
-                    "error": self._why or "PWM resource is unavailable"}
         released = []
         # Stop PWM: duty=0, enable=0
-        try:
-            (node / "duty_cycle").write_text("0", "ascii")
-            (node / "enable").write_text("0", "ascii")
-        except OSError as exc:
-            return {"ok": False, "resource": resource, "error": f"cannot stop PWM: {exc}"}
+        if node is not None:
+            try:
+                (node / "enable").write_text("0", "ascii")
+                if self._read_int("period", 0) > 0:
+                    (node / "duty_cycle").write_text("0", "ascii")
+            except OSError as exc:
+                return {"ok": False, "resource": resource, "error": f"cannot stop PWM: {exc}"}
+        else:
+            # Only an explicit, verifiably missing path is safe to forget.
+            if self.chip < 0 or self.channel < 0:
+                return {"ok": False, "resource": resource, "error": self._why}
+            target = PWM_ROOT / f"pwmchip{self.chip}" / f"pwm{self.channel}"
+            try:
+                target.stat()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                return {"ok": False, "resource": resource, "error": str(exc)}
+            else:
+                return {"ok": False, "resource": resource, "error": "PWM state cannot be confirmed"}
         # Never unexport PWM - fanctl only uses pre-exported channels
         if self.tach:
             # Query module set for actual ownership - only GPIO we exported via measure_hz is owned by us
@@ -432,7 +457,7 @@ class PwmChannel:
         self._exported_by_us = False
         self._duty = 0
         released.append({"ok": True, "resource": resource, "stopped": True,
-                         "unexported": False})
+                         "unexported": False, **({"missing": True} if node is None else {})})
         return {"ok": True, "resources": released}
 
     def _read_int(self, name: str, default: int = 0) -> int:
@@ -460,13 +485,34 @@ class PwmChannel:
             return None
         return rpm_from_hz(hz, self.pulses_per_rev)
 
+    def sample_rpm(self) -> None:
+        with self._sample_lock:
+            if self._retired or not self.tach:
+                return
+            try:
+                value = self.rpm()
+                reason = "" if value is not None else "tach_unavailable"
+            except Exception as exc:
+                value, reason = None, str(exc)
+            self._rpm_sample = (value, time.monotonic(), reason)
+
+    def cached_rpm(self) -> dict:
+        value, sampled_at, reason = self._rpm_sample
+        age = None if sampled_at is None else max(0.0, time.monotonic() - sampled_at)
+        if not self.tach:
+            value, reason = None, "not_configured"
+        elif age is not None and age > 10.0:
+            value, reason = None, "stale"
+        return {"rpm": value, "rpm_age_ms": None if age is None else round(age * 1000),
+                "rpm_reason": reason, "rpm_fresh": value is not None and not reason}
+
     def info(self, control_mode: str | None = None) -> dict:
         node = self.path()
         return {"id": self.id, "name": self.name, "pwm": self.pwm, "gpio": self.gpio,
                 "chip": self.chip, "channel": self.channel, "tach": self.tach or None,
                 "pulses_per_rev": self.pulses_per_rev,
                 "period_ns": self.period_ns, "duty": self.read_duty(), "pct": self.pct(),
-                "rpm": self.rpm(), "path": str(node) if node else None,
+                **self.cached_rpm(), "path": str(node) if node else None,
                 "hardware_available": node is not None,
                 "health": "ready" if node is not None else "unavailable",
                 "why": "" if node else self._why,
@@ -624,6 +670,7 @@ class Controller:
         self.last_pct: int | None = None
         self.manual_until = 0.0            # Global manual hold (legacy, for compatibility)
         self._auto_task: asyncio.Task | None = None
+        self._tach_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._inventory_lock = threading.RLock()  # Synchronous lock for socket dispatch
         # Per-instance manual overrides: {instance_id: {"pct": int, "until": float, "hold_s": float}}
@@ -776,8 +823,16 @@ class Controller:
                 except Exception as exc:
                     self.fans.remove(channel)
                     rollback = [item for item in self.inventory["instances"] if item["id"] != instance["id"]]
-                    self._persist_instances(rollback)
-                    channel.release()
+                    recovery_errors = []
+                    try:
+                        self._persist_instances(rollback)
+                    except Exception as rollback_error:
+                        recovery_errors.append(f"清单回滚失败：{rollback_error}")
+                    cleanup = channel.release()
+                    if not cleanup.get("ok"):
+                        recovery_errors.append(f"资源释放失败：{cleanup.get('error')}")
+                    if recovery_errors:
+                        raise RuntimeError(f"新实例启用失败：{exc}；{'；'.join(recovery_errors)}；请重新读取清单并检查硬件，勿重复创建") from None
                     raise RuntimeError(f"新实例已登记但无法启用，已回滚：{exc}") from None
             return {"ok": True, "instance": instance, "inventory": saved}
 
@@ -805,12 +860,12 @@ class Controller:
             candidate["instances"] = [item for item in candidate["instances"] if item["id"] != identifier]
             try:
                 saved = self._persist_instances(candidate["instances"])
-            except Exception:
+            except Exception as persist_error:
                 if active:
                     try:
                         active.apply(pct_to_duty(previous_pct, active.period_ns))
                     except Exception as restore_error:
-                        raise RuntimeError(f"清单保存失败且无法恢复实例输出：{restore_error}") from None
+                        raise RuntimeError(f"清单保存失败：{persist_error}；无法恢复实例输出：{restore_error}") from None
                 raise
             self.fans = [fan for fan in self.fans if fan.id != identifier]
             self._manual_overrides.pop(identifier, None)
@@ -818,6 +873,13 @@ class Controller:
                     "released": released, "inventory": saved}
 
     def _update_instance(self, instance_id: Any, instance: Any) -> dict:
+        current = next((fan for fan in self.fans if fan.id == str(instance_id or "")), None)
+        if current is not None:
+            with current._sample_lock:
+                return self._update_instance_locked(instance_id, instance)
+        return self._update_instance_locked(instance_id, instance)
+
+    def _update_instance_locked(self, instance_id: Any, instance: Any) -> dict:
         with self._inventory_lock:
             identifier = str(instance_id or "")
             if not isinstance(instance, dict) or instance.get("id") != identifier:
@@ -853,6 +915,7 @@ class Controller:
                 # Update channel properties
                 current.name = instance["name"]
                 current.tach = new_tach
+                current._rpm_sample = (None, None, "not_sampled")
                 current.period_ns = int(instance["period_ns"])
                 current.pulses_per_rev = int(instance.get("pulses_per_rev", PULSES_PER_REV))
                 # Tach ownership is tracked via _TACH_EXPORTED_BY_US module set after successful export in measure_hz.
@@ -860,9 +923,12 @@ class Controller:
                 try:
                     current.apply(pct_to_duty(previous_pct, current.period_ns))
                     saved = self._persist_instances(candidate["instances"])
-                except Exception:
+                except Exception as update_error:
                     current.name, current.tach, current.period_ns, current.pulses_per_rev = previous_properties
-                    current.apply(pct_to_duty(previous_pct, current.period_ns))
+                    try:
+                        current.apply(pct_to_duty(previous_pct, current.period_ns))
+                    except Exception as restore_error:
+                        raise RuntimeError(f"更新失败：{update_error}；恢复输出失败：{restore_error}") from None
                     raise
                 return {"ok": True, "instance": instance, "inventory": saved, "released": released}
             # Handle enabled->disabled: release active channel and tach
@@ -870,17 +936,20 @@ class Controller:
                 release_result = current.release()
                 released.extend(release_result.get("resources", []))
                 if not release_result.get("ok"):
-                    current.apply(pct_to_duty(previous_pct, current.period_ns))
+                    try:
+                        current.apply(pct_to_duty(previous_pct, current.period_ns))
+                    except Exception as restore_error:
+                        raise FanBusyError(f"禁用实例 {identifier} 失败：{release_result.get('error')}；恢复失败：{restore_error}") from None
                     raise FanBusyError(f"禁用实例 {identifier} 失败：{release_result.get('error')}")
                 self.fans.remove(current)
                 try:
                     saved = self._persist_instances(candidate["instances"])
-                except Exception:
+                except Exception as persist_error:
                     self.fans.append(current)
                     try:
                         current.apply(pct_to_duty(previous_pct, current.period_ns))
-                    except Exception:
-                        pass
+                    except Exception as restore_error:
+                        raise RuntimeError(f"清单保存失败：{persist_error}；恢复输出失败：{restore_error}") from None
                     raise
                 self._manual_overrides.pop(identifier, None)
                 return {"ok": True, "instance": instance, "inventory": saved, "released": released}
@@ -899,10 +968,8 @@ class Controller:
                         replacement.apply(pct_to_duty(safe_pct, replacement.period_ns))
                         self.fans.append(replacement)
                     except Exception as exc:
-                        self._save_inventory(previous_inventory)
-                        self.inventory = previous_inventory
-                        replacement.release()
-                        raise RuntimeError(f"启用新实例失败：{exc}") from None
+                        details = self._rollback_update(previous_inventory, replacement)
+                        raise RuntimeError(f"启用新实例失败：{exc}；{details}") from None
                 return {"ok": True, "instance": instance, "inventory": saved}
             # Handle different PWM resource (was_enabled and now_enabled but different resource)
             replacement = self._make_instance(instance) if now_enabled else None
@@ -916,15 +983,8 @@ class Controller:
                 rel = current.release()
                 released.extend(rel.get("resources", []))
                 if not rel.get("ok"):
-                    self._save_inventory(previous_inventory)
-                    self.inventory = previous_inventory
-                    if replacement:
-                        replacement.release()
-                    try:
-                        current.apply(pct_to_duty(previous_pct, current.period_ns))
-                    except Exception:
-                        pass
-                    raise FanBusyError(f"旧 PWM 资源释放失败：{rel.get('error')}")
+                    details = self._rollback_update(previous_inventory, replacement, current, previous_pct)
+                    raise FanBusyError(f"旧 PWM 资源释放失败：{rel.get('error')}；{details}")
                 self.fans.remove(current)
             try:
                 if replacement:
@@ -932,18 +992,31 @@ class Controller:
                     replacement.apply(pct_to_duty(safe_pct, replacement.period_ns))
                     self.fans.append(replacement)
             except Exception as exc:
-                self._save_inventory(previous_inventory)
-                self.inventory = previous_inventory
-                if replacement:
-                    replacement.release()
-                if current:
-                    try:
-                        current.apply(pct_to_duty(previous_pct, current.period_ns))
-                        self.fans.append(current)
-                    except Exception as restore_error:
-                        raise RuntimeError(f"更新失败且旧实例恢复失败：{restore_error}") from None
-                raise RuntimeError(f"配置已回滚，新实例未能启动：{exc}") from None
+                details = self._rollback_update(previous_inventory, replacement, current, previous_pct)
+                raise RuntimeError(f"新实例未能启动：{exc}；{details}") from None
             return {"ok": True, "instance": instance, "inventory": saved, "released": released}
+
+    def _rollback_update(self, inventory: dict, replacement=None, current=None, previous_pct=0) -> str:
+        errors = []
+        try:
+            self._save_inventory(inventory)
+            self.inventory = inventory
+        except Exception as exc:
+            errors.append(f"清单回滚失败：{exc}")
+        if replacement:
+            result = replacement.release()
+            if not result.get("ok"):
+                errors.append(f"新资源释放失败：{result.get('error')}")
+        if current:
+            # Retain tracking even if hardware recovery fails, so cleanup can
+            # be retried explicitly instead of orphaning a live resource.
+            if current not in self.fans:
+                self.fans.append(current)
+            try:
+                current.apply(pct_to_duty(previous_pct, current.period_ns))
+            except Exception as exc:
+                errors.append(f"旧输出恢复失败：{exc}")
+        return "；".join(errors) + "；请检查清单和硬件" if errors else "配置已回滚"
 
     # -- 辅助 --------------------------------------------------------
     def fan_index(self, index: Any) -> int:
@@ -1022,6 +1095,46 @@ class Controller:
                         else f"{eff:g} 秒后自动交回温控曲线"}
 
     # -- 自动温控循环 ------------------------------------------------
+    async def tach_loop(self) -> None:
+        # Bounded workers: no GPIO polling in the socket event loop, and no
+        # inventory lock is held during a sample. release() fences each channel.
+        semaphore = asyncio.Semaphore(4)
+
+        async def sample(channel: PwmChannel) -> None:
+            async with semaphore:
+                if not self._stop.is_set():
+                    await asyncio.to_thread(channel.sample_rpm)
+
+        def active_channels() -> list[PwmChannel]:
+            with self._inventory_lock:
+                return [channel for channel in self.fans if channel.tach]
+
+        while not self._stop.is_set():
+            channels = await asyncio.to_thread(active_channels)
+            await asyncio.gather(*(sample(channel) for channel in channels))
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+
+    def _auto_tick(self) -> None:
+        with self._inventory_lock:
+            now = time.monotonic()
+            for fid in [fid for fid, ov in self._manual_overrides.items() if ov["until"] < now]:
+                del self._manual_overrides[fid]
+            if self.mode != "auto":
+                return
+            pct = curve_pct(read_max_temp(), self.curve, self.default_pct)
+            for i, fan in enumerate(self.fans):
+                override = self._manual_overrides.get(fan.id)
+                if override and override["until"] >= now:
+                    continue
+                try:
+                    self._apply_index(i, pct)
+                except (RuntimeError, ValueError) as exc:
+                    log.warning("实例 %s 自动调速失败：%s", fan.id, exc)
+            self.last_pct = pct
+
     async def auto_loop(self) -> None:
         """每 AUTO_INTERVAL_S 秒：读温度 → 套曲线 → 变化才写 PWM。
 
@@ -1030,30 +1143,7 @@ class Controller:
         """
         while not self._stop.is_set():
             try:
-                # Expire per-instance overrides
-                now = time.monotonic()
-                expired_ids = [fid for fid, ov in self._manual_overrides.items()
-                               if ov["until"] < now]
-                for fid in expired_ids:
-                    del self._manual_overrides[fid]
-                    log.info("实例 %s 手动覆盖到期，交回自动温控", fid)
-
-                if self.mode == "auto":
-                    temp = read_max_temp()
-                    pct = curve_pct(temp, self.curve, self.default_pct)
-                    # Apply curve only to instances without active overrides
-                    for i, fan in enumerate(self.fans):
-                        override = self._manual_overrides.get(fan.id)
-                        if override and override["until"] >= now:
-                            # Instance has active override, skip auto control
-                            continue
-                        # Apply auto curve to this instance
-                        try:
-                            self._apply_index(i, pct)
-                        except (RuntimeError, ValueError) as exc:
-                            log.warning("实例 %s 自动调速失败：%s", fan.id, exc)
-                    self.last_pct = pct
-                    log.debug("温控 %s℃ -> %d%%", temp, pct)
+                await asyncio.to_thread(self._auto_tick)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1091,19 +1181,25 @@ class Controller:
         results = []
         for i in targets:
             fan = self.fan(i)
-            prev = fan.pct()
-            try:
-                fan.apply(fan.period_ns)       # 全速
-                time.sleep(1.0)                # 让风叶真的转起来，0.2 秒读到的是惯性
-                rpm = fan.rpm()
-            except (RuntimeError, ValueError) as exc:
-                results.append({"index": i, "name": fan.name, "ok": None, "error": str(exc)})
-                continue
-            finally:
+            with fan._sample_lock:
+                prev = fan.pct()
+                errors = []
+                rpm = None
                 try:
-                    fan.apply(pct_to_duty(prev, fan.period_ns))   # 回到原档
-                except Exception:
-                    pass
+                    fan.apply(fan.period_ns)
+                    time.sleep(1.0)
+                    rpm = fan.rpm()
+                except Exception as exc:
+                    errors.append(f"自检失败：{exc}")
+                finally:
+                    try:
+                        fan.apply(pct_to_duty(prev, fan.period_ns))
+                    except Exception as exc:
+                        errors.append(f"恢复原输出失败：{exc}")
+                if errors:
+                    results.append({"instance_id": fan.id, "index": i, "name": fan.name,
+                                    "ok": False, "error": "；".join(errors)})
+                    continue
             if rpm is None:
                 results.append({"instance_id": fan.id, "index": i, "name": fan.name, "ok": None, "rpm": None,
                                 "reason": "这颗没有测速线，只能靠听声音/手感判断（4pin 才有 tach）"})
@@ -1129,6 +1225,19 @@ class Controller:
                 return {"api_version": SOCKET_API_VERSION, "ok": False,
                         "code": "unsupported_version",
                         "error": f"不支持 socket API 版本 {version!r}；当前为 {SOCKET_API_VERSION}"}
+            if str(req.get("op") or "").lower() == "ping":
+                return {"api_version": SOCKET_API_VERSION, "ok": True, "pong": True,
+                        "fans": len(self.fans), "mode": self.mode}
+            if str(req.get("op") or "").lower() in ("status", "get", "temp"):
+                if not self._inventory_lock.acquire(blocking=False):
+                    return {"api_version": SOCKET_API_VERSION, "ok": False,
+                            "code": "resource_busy", "error": "风扇服务正在处理硬件操作，请稍后刷新"}
+                try:
+                    result = self._dispatch(req)
+                    result.setdefault("api_version", SOCKET_API_VERSION)
+                    return result
+                finally:
+                    self._inventory_lock.release()
             # Serialize all valid-version requests under the inventory lock.
             # This ensures concurrent socket requests are processed atomically.
             with self._inventory_lock:
@@ -1328,7 +1437,7 @@ async def serve(ctrl: Controller) -> None:
                 except ValueError as exc:
                     res = {"api_version": SOCKET_API_VERSION, "ok": False, "code": "invalid_request", "error": f"JSON 解析失败：{exc}"}
                 else:
-                    res = safe_handle(ctrl, req)
+                    res = await asyncio.to_thread(safe_handle, ctrl, req)
                 writer.write((json.dumps(res, ensure_ascii=False) + "\n").encode("utf-8"))
                 try:
                     await writer.drain()
@@ -1360,22 +1469,29 @@ async def serve(ctrl: Controller) -> None:
 
 
 async def run_service(ctrl: Controller) -> None:
-    ctrl.boot_apply()
+    await asyncio.to_thread(ctrl.boot_apply)
+    ctrl._tach_task = asyncio.create_task(ctrl.tach_loop(), name="fan-tach")
     if ctrl.auto_enable:
         ctrl.start_auto()
-    if ctrl.socket_enable:
-        await serve(ctrl)
-    else:
-        # 没开 socket：只跑自动温控，靠信号退出
-        stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, stop.set)
-            except (NotImplementedError, RuntimeError):
-                pass
-        await stop.wait()
-    ctrl.stop_auto()
+    try:
+        if ctrl.socket_enable:
+            await serve(ctrl)
+        else:
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, stop.set)
+                except (NotImplementedError, RuntimeError):
+                    pass
+            await stop.wait()
+    finally:
+        # Do not cancel to_thread sampling: join bounded workers so no GPIO
+        # access can survive service shutdown. PWM output remains unchanged.
+        ctrl._stop.set()
+        tasks = [task for task in (ctrl._tach_task, ctrl._auto_task) if task is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ================================================================ 命令行
